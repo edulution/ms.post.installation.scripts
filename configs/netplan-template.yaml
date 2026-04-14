@@ -1,0 +1,16 @@
+# Managed by mindspark_setup.sh — template for reference
+# Actual file is generated at /etc/netplan/01-mindspark-static.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    INTERFACE:
+      dhcp4: false
+      addresses:
+        - STATIC_IP/CIDR
+      routes:
+        - to: default
+          via: GATEWAY
+      nameservers:
+        addresses:
+          - DNS

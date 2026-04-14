@@ -1,0 +1,14 @@
+# Managed by mindspark_setup.sh — template for reference
+# Actual file is generated at /etc/dhcp/dhcpd.conf
+
+authoritative;
+
+default-lease-time LEASE_TIME;
+max-lease-time MAX_LEASE;
+
+subnet SUBNET netmask NETMASK {
+    range DHCP_START DHCP_END;
+    option routers GATEWAY;
+    option domain-name-servers DNS;
+    option broadcast-address BROADCAST;
+}
