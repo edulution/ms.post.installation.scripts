@@ -425,6 +425,18 @@ calculate_subnet() {
         $(( ip_parts[3] & mask_parts[3] ))
 }
 SUBNET=$(calculate_subnet)
+
+# Calculate broadcast address in pure bash (avoids mawk compl() incompatibility)
+calculate_broadcast() {
+    IFS='.' read -r -a ip_parts <<< "$STATIC_IP"
+    IFS='.' read -r -a mask_parts <<< "$NETMASK"
+    printf "%d.%d.%d.%d" \
+        $(( ip_parts[0] | (255 - mask_parts[0]) )) \
+        $(( ip_parts[1] | (255 - mask_parts[1]) )) \
+        $(( ip_parts[2] | (255 - mask_parts[2]) )) \
+        $(( ip_parts[3] | (255 - mask_parts[3]) ))
+}
+BROADCAST=$(calculate_broadcast)
 CHROME_URL="http://${STATIC_IP}"
 SYNC_STATUS_URL="${CHROME_URL}/Mindspark/SyncStatus.php"
 
@@ -503,6 +515,25 @@ PHASE="netplan"
 info "Configuring Netplan for static IP..."
 NETPLAN_FILE="${NETPLAN_DIR}/01-mindspark-static.yaml"
 
+# Auto-detect which renderer is active on this system.
+# Ubuntu Desktop uses NetworkManager; Ubuntu Server uses networkd.
+detect_netplan_renderer() {
+    if systemctl is-active --quiet NetworkManager; then
+        echo "NetworkManager"
+    elif systemctl is-active --quiet systemd-networkd; then
+        echo "networkd"
+    else
+        # Fall back to whichever is enabled
+        if systemctl is-enabled --quiet NetworkManager 2>/dev/null; then
+            echo "NetworkManager"
+        else
+            echo "networkd"
+        fi
+    fi
+}
+NETPLAN_RENDERER="$(detect_netplan_renderer)"
+info "Detected active network renderer: ${NETPLAN_RENDERER}"
+
 # Back up existing configs (tracked for rollback)
 for f in "${NETPLAN_DIR}"/*.yaml; do
     if [[ -f "$f" ]]; then
@@ -516,7 +547,7 @@ cat > "$NETPLAN_FILE" <<NETPLAN_EOF
 # Managed by mindspark_setup.sh — do not edit manually
 network:
   version: 2
-  renderer: networkd
+  renderer: ${NETPLAN_RENDERER}
   ethernets:
     ${NET_IFACE}:
       dhcp4: false
@@ -532,8 +563,10 @@ NETPLAN_EOF
 
 chmod 600 "$NETPLAN_FILE"
 netplan apply
+# Give the renderer a moment to apply the new address
+sleep 3
 PHASE="post-netplan"
-success "Netplan configured (${NETPLAN_FILE})"
+success "Netplan configured (${NETPLAN_FILE}) using renderer: ${NETPLAN_RENDERER}"
 
 # ----- 3.3  Install & configure Google Chrome --------------------------------
 PHASE="chrome"
@@ -718,23 +751,32 @@ subnet ${SUBNET} netmask ${NETMASK} {
     range ${DHCP_START} ${DHCP_END};
     option routers ${GATEWAY};
     option domain-name-servers ${DNS};
-    option broadcast-address $(echo "$SUBNET" | awk -F. -v m="$NETMASK" '
-        BEGIN { split(m,M,".") }
-        { printf "%d.%d.%d.%d",
-            or($1, compl(M[1]) % 256),
-            or($2, compl(M[2]) % 256),
-            or($3, compl(M[3]) % 256),
-            or($4, compl(M[4]) % 256) }');
+    option broadcast-address ${BROADCAST};
 }
 DHCP_EOF
 
-# Set the listening interface
-sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${NET_IFACE}\"/" "$DHCP_DEFAULT"
+# Set the listening interface — handle both quoted and unquoted existing values
+if grep -q '^INTERFACESv4=' "$DHCP_DEFAULT"; then
+    sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${NET_IFACE}\"/" "$DHCP_DEFAULT"
+else
+    echo "INTERFACESv4=\"${NET_IFACE}\"" >> "$DHCP_DEFAULT"
+fi
 success "DHCP configuration written to ${DHCP_CONF}"
+
+# Validate config before starting
+if ! dhcpd -t -cf "$DHCP_CONF" 2>/dev/null; then
+    error "dhcpd config test failed — check ${DHCP_CONF}"
+    dhcpd -t -cf "$DHCP_CONF" || true
+    exit 1
+fi
 
 # Enable and restart DHCP server
 systemctl enable isc-dhcp-server
-systemctl restart isc-dhcp-server
+if ! systemctl restart isc-dhcp-server; then
+    error "isc-dhcp-server failed to start. Journal output:"
+    journalctl -u isc-dhcp-server --no-pager -n 20 >&2 || true
+    exit 1
+fi
 success "isc-dhcp-server enabled and started"
 
 # =============================================================================
@@ -794,12 +836,22 @@ fi
 echo ""
 if [[ $ERRORS -eq 0 ]]; then
     echo -e "${GREEN}${BOLD}  All checks passed — setup complete!${NC}"
+    echo ""
+    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    info "Full log saved to: ${LOG_FILE}"
+    PHASE="done"
+    echo ""
+    echo -e "${GREEN}${BOLD}  MindSpark setup completed successfully.${NC}"
+    echo -e "${GREEN}${BOLD}  The system will reboot in 10 seconds...${NC}"
+    echo ""
+    sleep 10
+    reboot
 else
     echo -e "${RED}${BOLD}  ${ERRORS} check(s) failed — review the errors above.${NC}"
+    echo ""
+    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    info "Full log saved to: ${LOG_FILE}"
+    PHASE="done"
 fi
-echo ""
-echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
-echo ""
-info "Full log saved to: ${LOG_FILE}"
-
-PHASE="done"
