@@ -11,7 +11,7 @@
 # Usage:  ./mindspark_setup.sh
 # =============================================================================
 
-readonly VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.0"
 
 set -euo pipefail
 
@@ -66,7 +66,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ----- Pre-flight checks -----------------------------------------------------
-info "MindSpark setup v${VERSION} — $(date)"
+info "MindSpark setup v${SCRIPT_VERSION} — $(date)"
 info "Log file: ${LOG_FILE}"
 echo ""
 
