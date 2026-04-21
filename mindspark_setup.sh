@@ -100,8 +100,6 @@ case "$UBUNTU_VERSION" in
 esac
 
 # ----- Paths (must come before any function that references them) ------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OFFLINE_PACKAGES_DIR="${SCRIPT_DIR}/offline-packages"
 NETPLAN_DIR="/etc/netplan"
 DHCP_CONF="/etc/dhcp/dhcpd.conf"
 DHCP_DEFAULT="/etc/default/isc-dhcp-server"
@@ -123,106 +121,52 @@ is_online() {
     [[ "$_ONLINE_CACHED" == "yes" ]]
 }
 
-# --- Check / remediate cross-version .deb packages in offline-packages/ ------
-# Bundled packages built for a different Ubuntu release will be skipped.
-# If online, compatible replacements are downloaded automatically.
-check_offline_package_versions() {
-    local pkg_dir="${OFFLINE_PACKAGES_DIR}"
-    shopt -s nullglob
-    local debs=("${pkg_dir}"/*.deb)
-    shopt -u nullglob
-    [[ ${#debs[@]} -eq 0 ]] && return 0
+# --- Pre-flight runtime sanity (prevent running on already-broken systems) ---
+check_runtime_health() {
+    local failed=0
 
-    local bad_debs=()   # paths of mismatched .debs
-    local bad_pkgs=()   # base package names of mismatched .debs
-
-    for deb in "${debs[@]}"; do
-        local pkg_name pkg_ver
-        pkg_name=$(dpkg-deb --field "$deb" Package 2>/dev/null || true)
-        pkg_ver=$(dpkg-deb --field  "$deb" Version 2>/dev/null || true)
-
-        local bad=0
-        if [[ "$UBUNTU_VERSION" == "20.04" && "$pkg_name" == *t64 ]]; then
-            bad=1
-        fi
-        if [[ "$UBUNTU_VERSION" == "24.04" && "$pkg_ver" == *ubuntu0.20.04* ]]; then
-            bad=1
-        fi
-
-        if [[ $bad -eq 1 ]]; then
-            bad_debs+=("$deb")
-            bad_pkgs+=("$pkg_name")
-        fi
-    done
-
-    [[ ${#bad_debs[@]} -eq 0 ]] && return 0
-
-    warn "Found ${#bad_debs[@]} bundled package(s) built for a different Ubuntu release than ${UBUNTU_VERSION}:"
-    for deb in "${bad_debs[@]}"; do warn "  ${deb##*/}"; done
-
-    if is_online; then
-        info "Internet is available — incompatible bundled packages will be skipped; correct versions fetched via apt."
-    else
-        warn "Offline mode — incompatible bundled packages will be skipped (not installed)."
-        warn "Core packages already on the system will be used as-is."
-        warn "If a required package is missing, connect to the internet and re-run the script."
+    if ! python3 --version >/dev/null 2>&1; then
+        error "python3 failed to start. System runtime appears broken."
+        failed=1
     fi
-    # Files are NOT deleted — they stay in offline-packages/ for use on other machines.
-    # The version filter in install_bundled_debs / install_packages prevents them being used here.
+
+    if ! command -v netplan >/dev/null 2>&1; then
+        error "netplan command is missing (netplan.io not installed or damaged)."
+        failed=1
+    elif ! netplan --help >/dev/null 2>&1; then
+        error "netplan failed to start. System runtime appears broken."
+        failed=1
+    fi
+
+    if [[ $failed -ne 0 ]]; then
+        echo ""
+        error "SAFETY ABORT: core runtime tools are unhealthy before setup starts."
+        error "This usually means mixed Ubuntu package versions (e.g., GLIBC mismatch)."
+        error "Continuing could further damage the system; no changes were applied."
+        echo ""
+        if is_online; then
+            warn "Online recovery (first attempt):"
+            warn "  apt-get update"
+            warn "  apt-get -f install"
+            warn "  apt-get install --reinstall libc6 python3-minimal python3 netplan.io"
+        else
+            warn "Offline recovery: boot a matching Ubuntu Live USB and repair via chroot,"
+            warn "or reinstall the OS if package repair is not possible."
+        fi
+        exit 1
+    fi
 }
-check_offline_package_versions
+check_runtime_health
 
-# ----- Remaining defaults (networking, not path-dependent) -------------------
-
-# ---- Package helper: install from bundled .debs first, apt as fallback ------
-
-# Install all .deb files from offline-packages/ to satisfy dependencies locally.
-# Only installs packages that match the running Ubuntu version to prevent
-# cross-release library upgrades that can break the OS.
-install_bundled_debs() {
-    shopt -s nullglob
-    local all_debs=("${OFFLINE_PACKAGES_DIR}"/*.deb)
-    shopt -u nullglob
-
-    if [[ ${#all_debs[@]} -eq 0 ]]; then
-        return 0
+# ---- Package helper: apt-only install (online required) ---------------------
+_APT_UPDATED=0
+ensure_apt_index() {
+    if [[ $_APT_UPDATED -eq 0 ]]; then
+        apt-get update -qq
+        _APT_UPDATED=1
     fi
-
-    # Filter out packages that are clearly for a different Ubuntu release
-    local debs=()
-    for deb in "${all_debs[@]}"; do
-        local pkg_name pkg_ver
-        pkg_name=$(dpkg-deb --field "$deb" Package 2>/dev/null || true)
-        pkg_ver=$(dpkg-deb --field "$deb" Version 2>/dev/null || true)
-
-        # Skip 24.04-only t64 packages on 20.04
-        if [[ "$UBUNTU_VERSION" == "20.04" && "$pkg_name" == *t64 ]]; then
-            warn "Skipping ${deb##*/} — built for Ubuntu 24.04, not compatible with 20.04"
-            continue
-        fi
-        # Skip 20.04-versioned packages on 24.04
-        if [[ "$UBUNTU_VERSION" == "24.04" && "$pkg_ver" == *ubuntu0.20.04* ]]; then
-            warn "Skipping ${deb##*/} — built for Ubuntu 20.04, not compatible with 24.04"
-            continue
-        fi
-        debs+=("$deb")
-    done
-
-    if [[ ${#debs[@]} -eq 0 ]]; then
-        warn "No compatible bundled packages found for Ubuntu ${UBUNTU_VERSION}."
-        return 0
-    fi
-
-    info "Installing ${#debs[@]} bundled package(s) from ${OFFLINE_PACKAGES_DIR} ..."
-    dpkg -i --force-confdef --force-confold "${debs[@]}" 2>/dev/null || true
-    # Fix any broken dependencies from the local pool first
-    apt-get install -y -qq --no-download -f 2>/dev/null || true
 }
 
-# Try to install packages. Strategy:
-#   1. If the package is already installed, skip it.
-#   2. If a matching .deb exists in offline-packages/, dpkg -i it.
-#   3. Otherwise fall back to apt-get (requires internet).
 install_packages() {
     local to_install=()
     for pkg in "$@"; do
@@ -234,79 +178,14 @@ install_packages() {
 
     [[ ${#to_install[@]} -eq 0 ]] && return 0
 
-    # Try bundled .debs first (version-filtered to avoid cross-release installs)
-    local found_local=()
-    for pkg in "${to_install[@]}"; do
-        shopt -s nullglob
-        local matches=()
-        mapfile -d '' matches < <(find "${OFFLINE_PACKAGES_DIR}" -maxdepth 1 \( -name "${pkg}_*.deb" -o -name "${pkg}.deb" \) -print0 2>/dev/null)
-        shopt -u nullglob
-        for match in "${matches[@]}"; do
-            local m_name m_ver
-            m_name=$(dpkg-deb --field "$match" Package 2>/dev/null || true)
-            m_ver=$(dpkg-deb --field  "$match" Version  2>/dev/null || true)
-            # Skip packages that belong to the wrong Ubuntu release
-            if [[ "$UBUNTU_VERSION" == "20.04" && "$m_name" == *t64 ]]; then continue; fi
-            if [[ "$UBUNTU_VERSION" == "24.04" && "$m_ver"  == *ubuntu0.20.04* ]]; then continue; fi
-            found_local+=("$match")
-            break   # first compatible match is enough
-        done
-    done
-
-    if [[ ${#found_local[@]} -gt 0 ]]; then
-        info "Installing from bundled packages: ${to_install[*]}"
-        dpkg -i --force-confdef --force-confold "${found_local[@]}" 2>/dev/null || true
-        apt-get install -y -qq --no-download -f 2>/dev/null || true
-    fi
-
-    # Check if all are satisfied now; if not, try apt-get online
-    local still_missing=()
-    for pkg in "${to_install[@]}"; do
-        if ! dpkg -s "$pkg" &>/dev/null; then
-            still_missing+=("$pkg")
-        fi
-    done
-
-    if [[ ${#still_missing[@]} -gt 0 ]]; then
-        if is_online; then
-            info "Fetching remaining packages via apt: ${still_missing[*]}"
-            apt-get update -qq 2>/dev/null || true
-            apt-get install -y -qq "${still_missing[@]}"
-        else
-            warn "Offline and no bundled package found for: ${still_missing[*]}"
-            warn "Connect to the internet and re-run the script to install missing packages."
-        fi
-    fi
-}
-
-# Install a specific .deb by glob pattern from offline-packages/
-install_local_deb_if_present() {
-    local pattern="$1"
-    local package_label="$2"
-
-    local all_matches=()
-    mapfile -d '' all_matches < <(find "${OFFLINE_PACKAGES_DIR}" -maxdepth 1 -name "${pattern}" -print0 2>/dev/null)
-
-    # Filter to only version-compatible packages
-    local match=""
-    for candidate in "${all_matches[@]}"; do
-        local c_name c_ver
-        c_name=$(dpkg-deb --field "$candidate" Package 2>/dev/null || true)
-        c_ver=$(dpkg-deb --field  "$candidate" Version  2>/dev/null || true)
-        if [[ "$UBUNTU_VERSION" == "20.04" && "$c_name" == *t64 ]]; then continue; fi
-        if [[ "$UBUNTU_VERSION" == "24.04" && "$c_ver"  == *ubuntu0.20.04* ]]; then continue; fi
-        match="$candidate"
-        break
-    done
-
-    if [[ -z "$match" ]]; then
+    if ! is_online; then
+        error "Internet connection is required to install missing packages: ${to_install[*]}"
         return 1
     fi
 
-    info "Installing ${package_label} from local package ${match##*/}..."
-    dpkg -i --force-confdef --force-confold "$match" 2>/dev/null || true
-    apt-get install -y -qq --no-download -f 2>/dev/null || true
-    return 0
+    info "Installing via apt: ${to_install[*]}"
+    ensure_apt_index
+    apt-get install -y -qq --no-install-recommends "${to_install[@]}"
 }
 
 # Networking defaults
@@ -609,8 +488,7 @@ echo ""
 info "Starting configuration..."
 echo ""
 
-# Pre-install all bundled .deb packages so dependencies are satisfied locally
-install_bundled_debs
+# Packages are installed from apt repositories only.
 
 # =============================================================================
 # PHASE 3 — Apply configuration
@@ -670,13 +548,6 @@ install_google_chrome() {
         return 0
     fi
 
-    # Try bundled .deb first
-    if install_local_deb_if_present "google-chrome-stable*.deb" "Google Chrome"; then
-        success "Google Chrome installed from bundled package"
-        return 0
-    fi
-
-    # Fall back to online install
     info "Installing Google Chrome from online repository..."
     install_packages ca-certificates curl gnupg
 
@@ -688,7 +559,7 @@ install_google_chrome() {
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
         > /etc/apt/sources.list.d/google-chrome.list
 
-    apt-get update -qq
+    ensure_apt_index
     apt-get install -y -qq google-chrome-stable
     success "Google Chrome installed"
 }
@@ -758,27 +629,21 @@ info "Ensuring AnyDesk is installed..."
 if command -v anydesk &>/dev/null; then
     success "AnyDesk is already installed — skipping installation"
 else
-    # Try bundled .deb first
-    if install_local_deb_if_present "anydesk*.deb" "AnyDesk"; then
-        success "AnyDesk installed from bundled package"
-    else
-        # Fall back to online install
-        info "Installing AnyDesk from online repository..."
-        install_packages ca-certificates curl gnupg
+    info "Installing AnyDesk from online repository..."
+    install_packages ca-certificates curl gnupg
 
-        # Add AnyDesk GPG key and repository
-        install -m 0755 -d /etc/apt/keyrings
-        curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY \
-            | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg
-        chmod a+r /etc/apt/keyrings/anydesk.gpg
+    # Add AnyDesk GPG key and repository
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY \
+        | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg
+    chmod a+r /etc/apt/keyrings/anydesk.gpg
 
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" \
-            > /etc/apt/sources.list.d/anydesk.list
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/anydesk.gpg] http://deb.anydesk.com/ all main" \
+        > /etc/apt/sources.list.d/anydesk.list
 
-        apt-get update -qq
-        apt-get install -y -qq anydesk
-        success "AnyDesk installed"
-    fi
+    ensure_apt_index
+    apt-get install -y -qq anydesk
+    success "AnyDesk installed"
 fi
 
 PREV_ANYDESK_ID=""
@@ -831,7 +696,7 @@ if dpkg -s isc-dhcp-server &>/dev/null; then
 else
     info "Installing isc-dhcp-server..."
     if ! install_packages isc-dhcp-server; then
-        error "Failed to install isc-dhcp-server. Ensure the .deb is in offline-packages/ or that internet is available."
+        error "Failed to install isc-dhcp-server. Ensure internet access is available and apt repositories are reachable."
         exit 1
     fi
     success "isc-dhcp-server installed"
