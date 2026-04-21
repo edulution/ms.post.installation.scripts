@@ -563,8 +563,18 @@ NETPLAN_EOF
 
 chmod 600 "$NETPLAN_FILE"
 netplan apply
-# Give the renderer a moment to apply the new address
-sleep 3
+
+# For NetworkManager renderer, force NM to bring up the interface immediately.
+# netplan apply generates the NM connection profile but NM may not activate it
+# automatically if the interface was previously managed by a DHCP connection.
+if [[ "$NETPLAN_RENDERER" == "NetworkManager" ]]; then
+    nmcli connection reload 2>/dev/null || true
+    nmcli device connect "$NET_IFACE" 2>/dev/null || true
+    sleep 5
+else
+    sleep 3
+fi
+
 PHASE="post-netplan"
 success "Netplan configured (${NETPLAN_FILE}) using renderer: ${NETPLAN_RENDERER}"
 
@@ -795,11 +805,21 @@ ERRORS=0
 CURRENT_HOSTNAME=$(hostname)
 success "Hostname is ${CURRENT_HOSTNAME} (unchanged by script)"
 
-# Check static IP
-if ip addr show "$NET_IFACE" | grep -q "${STATIC_IP}"; then
+# Check static IP — retry for up to 30 seconds to allow renderer time to apply
+STATIC_IP_OK=false
+for _i in $(seq 1 30); do
+    if ip addr show "$NET_IFACE" 2>/dev/null | grep -q "${STATIC_IP}"; then
+        STATIC_IP_OK=true
+        break
+    fi
+    sleep 1
+done
+if $STATIC_IP_OK; then
     success "Static IP ${STATIC_IP} is assigned to ${NET_IFACE}"
 else
-    error "Static IP ${STATIC_IP} not found on ${NET_IFACE}"
+    error "Static IP ${STATIC_IP} not found on ${NET_IFACE} after 30 s"
+    info "Current addresses on ${NET_IFACE}:"
+    ip addr show "$NET_IFACE" >&2 || true
     ERRORS=$((ERRORS + 1))
 fi
 
@@ -825,33 +845,38 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
-# Check DHCP server
+# Check DHCP server — tracked separately so we can treat it as an expected warning
+DHCP_ERROR=false
 if systemctl is-active --quiet isc-dhcp-server; then
     success "isc-dhcp-server is running"
 else
-    error "isc-dhcp-server is NOT running"
-    ERRORS=$((ERRORS + 1))
+    warn "isc-dhcp-server is NOT running — this is expected if the Access Point is not yet plugged into the server"
+    DHCP_ERROR=true
 fi
 
 echo ""
+echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+info "Full log saved to: ${LOG_FILE}"
+PHASE="done"
+
 if [[ $ERRORS -eq 0 ]]; then
-    echo -e "${GREEN}${BOLD}  All checks passed — setup complete!${NC}"
+    # Only the DHCP warning (or nothing) — still reboot
+    if $DHCP_ERROR; then
+        echo ""
+        echo -e "${YELLOW}${BOLD}  Setup complete with 1 expected warning:${NC}"
+        echo -e "${YELLOW}${BOLD}  isc-dhcp-server will start automatically once the${NC}"
+        echo -e "${YELLOW}${BOLD}  Access Point is plugged into this server.${NC}"
+    else
+        echo ""
+        echo -e "${GREEN}${BOLD}  All checks passed — setup complete!${NC}"
+    fi
     echo ""
-    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    info "Full log saved to: ${LOG_FILE}"
-    PHASE="done"
-    echo ""
-    echo -e "${GREEN}${BOLD}  MindSpark setup completed successfully.${NC}"
     echo -e "${GREEN}${BOLD}  The system will reboot in 10 seconds...${NC}"
     echo ""
     sleep 10
     reboot
 else
-    echo -e "${RED}${BOLD}  ${ERRORS} check(s) failed — review the errors above.${NC}"
+    echo -e "${RED}${BOLD}  ${ERRORS} critical check(s) failed — review the errors above.${NC}"
+    echo -e "${RED}${BOLD}  The system will NOT reboot until these are resolved.${NC}"
     echo ""
-    echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    info "Full log saved to: ${LOG_FILE}"
-    PHASE="done"
 fi
