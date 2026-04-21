@@ -19,6 +19,12 @@ This repository contains:
 3. **Installs/refreshes AnyDesk** — adds the official AnyDesk repository and GPG key, installs AnyDesk if missing, then clears retained AnyDesk state so a fresh AnyDesk ID is generated on each script run.
 4. **Installs & configures isc-dhcp-server** — sets up the DHCP scope so client devices automatically receive the educational-content broadcast.
 
+### Hostname behavior
+
+- The script **does not change the system hostname**.
+- The optional server number prompt is used for operator labels/reporting only.
+- Existing hostname remains as configured on the laptop/server.
+
 ### Workflow
 
 ```

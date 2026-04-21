@@ -99,28 +99,121 @@ case "$UBUNTU_VERSION" in
         ;;
 esac
 
-# ----- Defaults (edit these or override via the prompts) ----------------------
+# ----- Paths (must come before any function that references them) ------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OFFLINE_PACKAGES_DIR="${SCRIPT_DIR}/offline-packages"
 NETPLAN_DIR="/etc/netplan"
 DHCP_CONF="/etc/dhcp/dhcpd.conf"
 DHCP_DEFAULT="/etc/default/isc-dhcp-server"
 CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/mindspark.json"
 CHROMIUM_POLICY_FILE="/etc/chromium/policies/managed/mindspark.json"
-OFFLINE_PACKAGES_DIR="${SCRIPT_DIR}/offline-packages"
+
+# --- Online connectivity check -----------------------------------------------
+# Result is cached after the first call so subsequent callers pay no extra cost.
+_ONLINE_CACHED=""
+is_online() {
+    if [[ -z "$_ONLINE_CACHED" ]]; then
+        if (echo > /dev/tcp/8.8.8.8/53) 2>/dev/null || \
+           (echo > /dev/tcp/1.1.1.1/53) 2>/dev/null; then
+            _ONLINE_CACHED="yes"
+        else
+            _ONLINE_CACHED="no"
+        fi
+    fi
+    [[ "$_ONLINE_CACHED" == "yes" ]]
+}
+
+# --- Check / remediate cross-version .deb packages in offline-packages/ ------
+# Bundled packages built for a different Ubuntu release will be skipped.
+# If online, compatible replacements are downloaded automatically.
+check_offline_package_versions() {
+    local pkg_dir="${OFFLINE_PACKAGES_DIR}"
+    shopt -s nullglob
+    local debs=("${pkg_dir}"/*.deb)
+    shopt -u nullglob
+    [[ ${#debs[@]} -eq 0 ]] && return 0
+
+    local bad_debs=()   # paths of mismatched .debs
+    local bad_pkgs=()   # base package names of mismatched .debs
+
+    for deb in "${debs[@]}"; do
+        local pkg_name pkg_ver
+        pkg_name=$(dpkg-deb --field "$deb" Package 2>/dev/null || true)
+        pkg_ver=$(dpkg-deb --field  "$deb" Version 2>/dev/null || true)
+
+        local bad=0
+        if [[ "$UBUNTU_VERSION" == "20.04" && "$pkg_name" == *t64 ]]; then
+            bad=1
+        fi
+        if [[ "$UBUNTU_VERSION" == "24.04" && "$pkg_ver" == *ubuntu0.20.04* ]]; then
+            bad=1
+        fi
+
+        if [[ $bad -eq 1 ]]; then
+            bad_debs+=("$deb")
+            bad_pkgs+=("$pkg_name")
+        fi
+    done
+
+    [[ ${#bad_debs[@]} -eq 0 ]] && return 0
+
+    warn "Found ${#bad_debs[@]} bundled package(s) built for a different Ubuntu release than ${UBUNTU_VERSION}:"
+    for deb in "${bad_debs[@]}"; do warn "  ${deb##*/}"; done
+
+    if is_online; then
+        info "Internet is available — incompatible bundled packages will be skipped; correct versions fetched via apt."
+    else
+        warn "Offline mode — incompatible bundled packages will be skipped (not installed)."
+        warn "Core packages already on the system will be used as-is."
+        warn "If a required package is missing, connect to the internet and re-run the script."
+    fi
+    # Files are NOT deleted — they stay in offline-packages/ for use on other machines.
+    # The version filter in install_bundled_debs / install_packages prevents them being used here.
+}
+check_offline_package_versions
+
+# ----- Remaining defaults (networking, not path-dependent) -------------------
 
 # ---- Package helper: install from bundled .debs first, apt as fallback ------
 
 # Install all .deb files from offline-packages/ to satisfy dependencies locally.
+# Only installs packages that match the running Ubuntu version to prevent
+# cross-release library upgrades that can break the OS.
 install_bundled_debs() {
     shopt -s nullglob
-    local debs=("${OFFLINE_PACKAGES_DIR}"/*.deb)
+    local all_debs=("${OFFLINE_PACKAGES_DIR}"/*.deb)
     shopt -u nullglob
 
-    if [[ ${#debs[@]} -eq 0 ]]; then
+    if [[ ${#all_debs[@]} -eq 0 ]]; then
         return 0
     fi
 
-    info "Installing bundled packages from ${OFFLINE_PACKAGES_DIR} ..."
+    # Filter out packages that are clearly for a different Ubuntu release
+    local debs=()
+    for deb in "${all_debs[@]}"; do
+        local pkg_name pkg_ver
+        pkg_name=$(dpkg-deb --field "$deb" Package 2>/dev/null || true)
+        pkg_ver=$(dpkg-deb --field "$deb" Version 2>/dev/null || true)
+
+        # Skip 24.04-only t64 packages on 20.04
+        if [[ "$UBUNTU_VERSION" == "20.04" && "$pkg_name" == *t64 ]]; then
+            warn "Skipping ${deb##*/} — built for Ubuntu 24.04, not compatible with 20.04"
+            continue
+        fi
+        # Skip 20.04-versioned packages on 24.04
+        if [[ "$UBUNTU_VERSION" == "24.04" && "$pkg_ver" == *ubuntu0.20.04* ]]; then
+            warn "Skipping ${deb##*/} — built for Ubuntu 20.04, not compatible with 24.04"
+            continue
+        fi
+        debs+=("$deb")
+    done
+
+    if [[ ${#debs[@]} -eq 0 ]]; then
+        warn "No compatible bundled packages found for Ubuntu ${UBUNTU_VERSION}."
+        return 0
+    fi
+
+    info "Installing ${#debs[@]} bundled package(s) from ${OFFLINE_PACKAGES_DIR} ..."
     dpkg -i --force-confdef --force-confold "${debs[@]}" 2>/dev/null || true
     # Fix any broken dependencies from the local pool first
     apt-get install -y -qq --no-download -f 2>/dev/null || true
@@ -141,16 +234,23 @@ install_packages() {
 
     [[ ${#to_install[@]} -eq 0 ]] && return 0
 
-    # Try bundled .debs first
+    # Try bundled .debs first (version-filtered to avoid cross-release installs)
     local found_local=()
     for pkg in "${to_install[@]}"; do
         shopt -s nullglob
         local matches=()
         mapfile -d '' matches < <(find "${OFFLINE_PACKAGES_DIR}" -maxdepth 1 \( -name "${pkg}_*.deb" -o -name "${pkg}.deb" \) -print0 2>/dev/null)
         shopt -u nullglob
-        if [[ ${#matches[@]} -gt 0 ]]; then
-            found_local+=("${matches[0]}")
-        fi
+        for match in "${matches[@]}"; do
+            local m_name m_ver
+            m_name=$(dpkg-deb --field "$match" Package 2>/dev/null || true)
+            m_ver=$(dpkg-deb --field  "$match" Version  2>/dev/null || true)
+            # Skip packages that belong to the wrong Ubuntu release
+            if [[ "$UBUNTU_VERSION" == "20.04" && "$m_name" == *t64 ]]; then continue; fi
+            if [[ "$UBUNTU_VERSION" == "24.04" && "$m_ver"  == *ubuntu0.20.04* ]]; then continue; fi
+            found_local+=("$match")
+            break   # first compatible match is enough
+        done
     done
 
     if [[ ${#found_local[@]} -gt 0 ]]; then
@@ -168,9 +268,14 @@ install_packages() {
     done
 
     if [[ ${#still_missing[@]} -gt 0 ]]; then
-        info "Fetching remaining packages via apt: ${still_missing[*]}"
-        apt-get update -qq 2>/dev/null || true
-        apt-get install -y -qq "${still_missing[@]}"
+        if is_online; then
+            info "Fetching remaining packages via apt: ${still_missing[*]}"
+            apt-get update -qq 2>/dev/null || true
+            apt-get install -y -qq "${still_missing[@]}"
+        else
+            warn "Offline and no bundled package found for: ${still_missing[*]}"
+            warn "Connect to the internet and re-run the script to install missing packages."
+        fi
     fi
 }
 
@@ -179,15 +284,27 @@ install_local_deb_if_present() {
     local pattern="$1"
     local package_label="$2"
 
-    local matches=()
-    mapfile -d '' matches < <(find "${OFFLINE_PACKAGES_DIR}" -maxdepth 1 -name "${pattern}" -print0 2>/dev/null)
+    local all_matches=()
+    mapfile -d '' all_matches < <(find "${OFFLINE_PACKAGES_DIR}" -maxdepth 1 -name "${pattern}" -print0 2>/dev/null)
 
-    if [[ ${#matches[@]} -eq 0 ]]; then
+    # Filter to only version-compatible packages
+    local match=""
+    for candidate in "${all_matches[@]}"; do
+        local c_name c_ver
+        c_name=$(dpkg-deb --field "$candidate" Package 2>/dev/null || true)
+        c_ver=$(dpkg-deb --field  "$candidate" Version  2>/dev/null || true)
+        if [[ "$UBUNTU_VERSION" == "20.04" && "$c_name" == *t64 ]]; then continue; fi
+        if [[ "$UBUNTU_VERSION" == "24.04" && "$c_ver"  == *ubuntu0.20.04* ]]; then continue; fi
+        match="$candidate"
+        break
+    done
+
+    if [[ -z "$match" ]]; then
         return 1
     fi
 
-    info "Installing ${package_label} from local package ${matches[0]}..."
-    dpkg -i --force-confdef --force-confold "${matches[0]}" 2>/dev/null || true
+    info "Installing ${package_label} from local package ${match##*/}..."
+    dpkg -i --force-confdef --force-confold "$match" 2>/dev/null || true
     apt-get install -y -qq --no-download -f 2>/dev/null || true
     return 0
 }
@@ -251,14 +368,19 @@ echo -e "${BOLD}   MindSpark Server Post-Installation Setup${NC}"
 echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# --- Server number -----------------------------------------------------------
-read -rp "Enter the MindSpark server number (e.g. 1, 2, 3): " SERVER_NUM
-# Validate: must be a positive integer
-if ! [[ "$SERVER_NUM" =~ ^[0-9]+$ ]] || [[ "$SERVER_NUM" -eq 0 ]]; then
-    error "Server number must be a positive integer."
-    exit 1
+# --- Optional server label ---------------------------------------------------
+read -rp "Optional: enter MindSpark server number for labels/reporting only (press Enter to skip): " SERVER_NUM
+SERVER_LABEL=""
+if [[ -n "$SERVER_NUM" ]]; then
+    # Validate only when provided: must be a positive integer
+    if ! [[ "$SERVER_NUM" =~ ^[0-9]+$ ]] || [[ "$SERVER_NUM" -eq 0 ]]; then
+        error "Server number must be a positive integer when provided."
+        exit 1
+    fi
+    SERVER_LABEL="mindsparkserver${SERVER_NUM}"
 fi
-HOSTNAME="mindsparkserver${SERVER_NUM}"
+
+CURRENT_HOSTNAME="$(hostname)"
 
 # --- Country ---------------------------------------------------------------
 echo ""
@@ -450,7 +572,12 @@ echo -e "${BOLD}═════════════════════�
 echo -e "${BOLD}   CONFIGURATION SUMMARY${NC}"
 echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Hostname:          ${CYAN}${HOSTNAME}${NC}"
+echo -e "  Hostname (current):${CYAN}${CURRENT_HOSTNAME}${NC}  (will remain unchanged)"
+if [[ -n "$SERVER_LABEL" ]]; then
+    echo -e "  Server label:      ${CYAN}${SERVER_LABEL}${NC}"
+else
+    echo -e "  Server label:      ${CYAN}(not set)${NC}"
+fi
 echo -e "  Country:           ${CYAN}${COUNTRY}${NC}"
 echo -e "  Interface:         ${CYAN}${NET_IFACE}${NC}  (MAC: ${IFACE_MAC})"
 echo -e "  Static IP:         ${CYAN}${STATIC_IP}/${CIDR}${NC}"
@@ -489,21 +616,9 @@ install_bundled_debs
 # PHASE 3 — Apply configuration
 # =============================================================================
 
-# ----- 3.1  Set hostname -----------------------------------------------------
-PHASE="hostname"
-if [[ "$(hostname)" == "$HOSTNAME" ]]; then
-    success "Hostname is already '${HOSTNAME}' — no change needed"
-else
-    info "Setting hostname to '${HOSTNAME}'..."
-    hostnamectl set-hostname "$HOSTNAME"
-    success "Hostname set to ${HOSTNAME}"
-fi
-# Ensure /etc/hosts entry exists regardless
-if grep -q "127.0.1.1" /etc/hosts; then
-    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${HOSTNAME}/" /etc/hosts
-else
-    echo -e "127.0.1.1\t${HOSTNAME}" >> /etc/hosts
-fi
+# ----- 3.1  Hostname policy --------------------------------------------------
+PHASE="hostname-policy"
+info "Leaving system hostname unchanged: $(hostname)"
 
 # ----- 3.2  Configure Netplan (static IP) ------------------------------------
 PHASE="netplan"
@@ -769,14 +884,9 @@ echo ""
 
 ERRORS=0
 
-# Check hostname
+# Check hostname (informational only; hostname is intentionally unchanged)
 CURRENT_HOSTNAME=$(hostname)
-if [[ "$CURRENT_HOSTNAME" == "$HOSTNAME" ]]; then
-    success "Hostname is ${CURRENT_HOSTNAME}"
-else
-    error "Hostname mismatch: expected ${HOSTNAME}, got ${CURRENT_HOSTNAME}"
-    ERRORS=$((ERRORS + 1))
-fi
+success "Hostname is ${CURRENT_HOSTNAME} (unchanged by script)"
 
 # Check static IP
 if ip addr show "$NET_IFACE" | grep -q "${STATIC_IP}"; then
