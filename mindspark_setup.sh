@@ -6,9 +6,11 @@
 # Performs:
 #   1. AnyDesk installation (official repo)
 #   2. Static IP configuration (Netplan)
-#   3. isc-dhcp-server installation & DHCP scope configuration
+#   3. Kea DHCP4 server installation & scope configuration
+#   4. NTP synchronisation hardening
+#   5. Google Chrome installation & policy configuration
 #
-# Usage:  ./mindspark_setup.sh
+# Usage:  sudo ./mindspark_setup.sh
 # =============================================================================
 
 readonly SCRIPT_VERSION="1.0.0"
@@ -72,7 +74,7 @@ echo ""
 
 if [[ $EUID -ne 0 ]]; then
     info "Root privileges are required. Re-running with sudo..."
-    exec sudo -k bash "$0" "$@"
+    exec sudo -k -- "$0" "$@"
 fi
 
 if [[ ! -r /etc/os-release ]]; then
@@ -101,8 +103,8 @@ esac
 
 # ----- Paths (must come before any function that references them) ------------
 NETPLAN_DIR="/etc/netplan"
-DHCP_CONF="/etc/dhcp/dhcpd.conf"
-DHCP_DEFAULT="/etc/default/isc-dhcp-server"
+KEA_CONF_DIR="/etc/kea"
+KEA_CONF="${KEA_CONF_DIR}/kea-dhcp4.conf"
 CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/mindspark.json"
 CHROMIUM_POLICY_FILE="/etc/chromium/policies/managed/mindspark.json"
 
@@ -189,41 +191,95 @@ install_packages() {
 }
 
 # --- AP MAC detection --------------------------------------------------------
-# Probes $NET_IFACE after setup to discover the Access Point's MAC address.
-# Strategy:
-#   1. Ping broadcast and gateway to trigger ARP replies.
-#   2. Poll 'ip neigh' for up to 45 seconds.
-#   3. Fall back to parsing dhcpd.leases if ARP yields nothing.
+# Top-level helper: reads ARP/neighbour tables on $1 excluding the server's own IP $2.
+# Prints the first foreign MAC found; returns 1 if none.
+_read_arp_table() {
+    local iface="$1" server_ip="$2"
+    local found=""
+
+    # ip neigh — catches REACHABLE, STALE, DELAY entries (case-insensitive MAC)
+    found=$(ip neigh show dev "$iface" 2>/dev/null \
+        | grep -iv "^${server_ip}[[:space:]]" \
+        | grep -iE 'lladdr [0-9a-f]{2}:' \
+        | awk '{print $5}' \
+        | grep -iv '^$' \
+        | head -1)
+    [[ -n "$found" ]] && { echo "$found"; return 0; }
+
+    # arp -n — legacy table, sometimes has entries ip neigh doesn't
+    found=$(arp -n 2>/dev/null \
+        | awk -v iface="$iface" -v server="$server_ip" \
+            'NR>1 && $1 != server && $5 == iface && $3 != "" && $3 != "(incomplete)" {print $3}' \
+        | head -1)
+    [[ -n "$found" ]] && { echo "$found"; return 0; }
+
+    return 1
+}
+
+# Top-level helper: rate-limited arping sweep of the subnet to populate the ARP
+# cache before detect_ap_mac polls it. Fires up to BATCH_SIZE probes concurrently
+# to avoid flooding the link or triggering intrusion detection.
+# Usage: _trigger_arp_sweep <iface> <server_ip> <subnet_prefix>
+_trigger_arp_sweep() {
+    local iface="$1" server_ip="$2" prefix="$3"
+    local batch_size=10 batch_pids=()
+
+    for _h in $(seq 1 254); do
+        local target="${prefix}.${_h}"
+        [[ "$target" == "$server_ip" ]] && continue
+
+        if command -v arping &>/dev/null; then
+            arping -c 1 -w 1 -I "$iface" "$target" &>/dev/null &
+        else
+            ping -c 1 -W 1 "$target" &>/dev/null &
+        fi
+        batch_pids+=($!)
+
+        # Wait for the batch to drain before launching the next one
+        if (( ${#batch_pids[@]} >= batch_size )); then
+            wait "${batch_pids[@]}" 2>/dev/null || true
+            batch_pids=()
+        fi
+    done
+    # Wait for any remaining probes
+    [[ ${#batch_pids[@]} -gt 0 ]] && { wait "${batch_pids[@]}" 2>/dev/null || true; }
+}
+
+# Probes $NET_IFACE for up to 60 s to discover the Access Point's MAC address.
+# The AP has a static management IP in the subnet (not the gateway address) so we
+# arping-scan the entire usable range to trigger an ARP reply from whatever IP the AP
+# was pre-configured with. Falls back to the Kea leases file.
+# Usage: detect_ap_mac <iface> <server_ip>
 # Prints the MAC to stdout; returns 1 if not found.
 detect_ap_mac() {
-    local iface="$1" server_ip="$2" broadcast_addr="$3" gateway_addr="$4"
-    local mac=""
+    local iface="$1" server_ip="$2"
+    local mac="" subnet_prefix="${server_ip%.*}"
 
-    info "Probing network to detect Access Point MAC address (up to 45 s)..."
+    info "Probing network to detect Access Point MAC address (up to 60 s)..."
 
-    # Trigger ARP entries
-    ping -b -c 3 -W 1 "$broadcast_addr" &>/dev/null || true
-    ping -c 3 -W 1 "$gateway_addr" &>/dev/null || true
+    # Launch the rate-limited sweep in the background; don't block the polling loop
+    _trigger_arp_sweep "$iface" "$server_ip" "$subnet_prefix" &
+    local sweep_pid=$!
 
-    # Poll ARP table
-    for _ap_i in $(seq 1 45); do
-        mac=$(ip neigh show dev "$iface" 2>/dev/null \
-            | grep -v "^${server_ip} " \
-            | grep -E 'lladdr [0-9a-f]{2}:' \
-            | awk '{print $5}' \
-            | grep -v '^$' \
-            | head -1)
+    for _ap_i in $(seq 1 60); do
+        mac=$(_read_arp_table "$iface" "$server_ip" || true)
         if [[ -n "$mac" ]]; then
+            # Clean up the background sweep before returning
+            kill "$sweep_pid" 2>/dev/null || true
+            wait "$sweep_pid" 2>/dev/null || true
             echo "$mac"
             return 0
         fi
         sleep 1
     done
 
-    # Fallback: parse dhcpd.leases
-    local leases_file="/var/lib/dhcp/dhcpd.leases"
+    wait "$sweep_pid" 2>/dev/null || true
+
+    # Fallback: parse Kea leases file — case-insensitive
+    local leases_file="/var/lib/kea/dhcp4.leases"
     if [[ -f "$leases_file" ]]; then
-        mac=$(grep -oP '(?<=hardware ethernet )[0-9a-f:]+' "$leases_file" | head -1)
+        mac=$(grep -ioP '"hw-address"\s*:\s*"\K[0-9a-fA-F:]+' "$leases_file" \
+            | tr '[:upper:]' '[:lower:]' | head -1)
         if [[ -n "$mac" ]]; then
             echo "$mac"
             return 0
@@ -233,11 +289,37 @@ detect_ap_mac() {
     return 1
 }
 
+# --- Input validation -------------------------------------------------------
+# Returns 0 if the argument is a valid dotted-decimal IPv4 address.
+validate_ipv4() {
+    local ip="$1"
+    local re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if [[ ! "$ip" =~ $re ]]; then return 1; fi
+    IFS='.' read -r -a parts <<< "$ip"
+    for part in "${parts[@]}"; do
+        (( part >= 0 && part <= 255 )) || return 1
+    done
+    return 0
+}
+
+# Prompts for an IP, re-asking until valid. Usage: prompt_ip VAR PROMPT DEFAULT
+prompt_ip() {
+    local -n _pi_ref="$1"
+    local prompt="$2" default="$3"
+    while true; do
+        read -rp "${prompt} [${default}]: " _pi_ref
+        _pi_ref="${_pi_ref:-$default}"
+        if validate_ipv4 "$_pi_ref"; then break; fi
+        warn "'${_pi_ref}' is not a valid IPv4 address. Please try again."
+    done
+}
+
 # Networking defaults
 DEFAULT_SUBNET="10.10.10.0"
 DEFAULT_NETMASK="255.255.255.0"
 DEFAULT_GATEWAY="10.10.10.1"
 DEFAULT_DNS="8.8.8.8"
+DEFAULT_DNS2="8.8.4.4"
 DEFAULT_DHCP_RANGE_START="10.10.10.100"
 DEFAULT_DHCP_RANGE_END="10.10.10.200"
 DEFAULT_DHCP_LEASE_TIME="600"
@@ -421,23 +503,23 @@ info "Will configure interface: ${NET_IFACE}"
 STATIC_IP="$DEFAULT_STATIC_IP"
 info "Static IP is auto-assigned from country: ${STATIC_IP}"
 
-read -rp "Enter the subnet mask [${DEFAULT_NETMASK}]: " NETMASK
-NETMASK="${NETMASK:-$DEFAULT_NETMASK}"
+# Validate netmask manually (not an IP probe but same format)
+while true; do
+    read -rp "Enter the subnet mask [${DEFAULT_NETMASK}]: " NETMASK
+    NETMASK="${NETMASK:-$DEFAULT_NETMASK}"
+    if validate_ipv4 "$NETMASK"; then break; fi
+    warn "'${NETMASK}' is not a valid subnet mask. Please try again."
+done
 
-read -rp "Enter the gateway [${DEFAULT_GATEWAY}]: " GATEWAY
-GATEWAY="${GATEWAY:-$DEFAULT_GATEWAY}"
-
-read -rp "Enter the DNS server [${DEFAULT_DNS}]: " DNS
-DNS="${DNS:-$DEFAULT_DNS}"
+prompt_ip GATEWAY "Enter the gateway" "$DEFAULT_GATEWAY"
+prompt_ip DNS     "Enter the primary DNS server" "$DEFAULT_DNS"
+prompt_ip DNS2    "Enter the secondary DNS server" "$DEFAULT_DNS2"
 
 # --- DHCP scope --------------------------------------------------------------
 echo ""
-echo -e "${BOLD}DHCP scope configuration${NC}"
-read -rp "DHCP range start [${DEFAULT_DHCP_RANGE_START}]: " DHCP_START
-DHCP_START="${DHCP_START:-$DEFAULT_DHCP_RANGE_START}"
-
-read -rp "DHCP range end   [${DEFAULT_DHCP_RANGE_END}]: " DHCP_END
-DHCP_END="${DHCP_END:-$DEFAULT_DHCP_RANGE_END}"
+printf "${BOLD}DHCP scope configuration${NC}\n"
+prompt_ip DHCP_START "DHCP range start" "$DEFAULT_DHCP_RANGE_START"
+prompt_ip DHCP_END   "DHCP range end  " "$DEFAULT_DHCP_RANGE_END"
 
 read -rp "Default lease time (seconds) [${DEFAULT_DHCP_LEASE_TIME}]: " LEASE_TIME
 LEASE_TIME="${LEASE_TIME:-$DEFAULT_DHCP_LEASE_TIME}"
@@ -470,7 +552,25 @@ calculate_subnet() {
         $(( ip_parts[3] & mask_parts[3] ))
 }
 SUBNET=$(calculate_subnet)
-AP_MGMT_IP="${SUBNET%.*}.2"   # Reserved management IP for the Access Point
+
+# Calculate a safe AP management IP: first host address in the subnet that is
+# not the server itself. Works for any prefix length, not just /24.
+calculate_ap_mgmt_ip() {
+    IFS='.' read -r -a net_parts <<< "$SUBNET"
+    # Increment the last octet of the network address by 1 to get first host,
+    # then by 2 if that collides with the server IP.
+    local candidate
+    candidate=$(printf "%d.%d.%d.%d" \
+        "${net_parts[0]}" "${net_parts[1]}" "${net_parts[2]}" \
+        $(( net_parts[3] + 1 )))
+    if [[ "$candidate" == "$STATIC_IP" ]]; then
+        candidate=$(printf "%d.%d.%d.%d" \
+            "${net_parts[0]}" "${net_parts[1]}" "${net_parts[2]}" \
+            $(( net_parts[3] + 2 )))
+    fi
+    echo "$candidate"
+}
+AP_MGMT_IP="$(calculate_ap_mgmt_ip)"
 AP_MAC=""                      # Populated in Phase 3.6 after DHCP server starts
 
 # Calculate broadcast address in pure bash (avoids mawk compl() incompatibility)
@@ -498,7 +598,7 @@ if command -v anydesk &>/dev/null; then
     ANYDESK_STATUS="Already installed — will regenerate ID only"
 fi
 DHCP_STATUS="Install & configure"
-if dpkg -s isc-dhcp-server &>/dev/null; then
+if dpkg -s kea-dhcp4 &>/dev/null; then
     DHCP_STATUS="Already installed — will update configuration only"
 fi
 
@@ -520,10 +620,12 @@ echo -e "  Country:           ${CYAN}${COUNTRY}${NC}"
 echo -e "  Interface:         ${CYAN}${NET_IFACE}${NC}  (MAC: ${IFACE_MAC})"
 echo -e "  Static IP:         ${CYAN}${STATIC_IP}/${CIDR}${NC}"
 echo -e "  Gateway:           ${CYAN}${GATEWAY}${NC}"
-echo -e "  DNS:               ${CYAN}${DNS}${NC}"
+echo -e "  DNS (primary):     ${CYAN}${DNS}${NC}"
+echo -e "  DNS (secondary):   ${CYAN}${DNS2}${NC}"
 echo ""
 echo -e "  DHCP subnet:       ${CYAN}${SUBNET}/${CIDR}${NC}"
 echo -e "  DHCP range:        ${CYAN}${DHCP_START} – ${DHCP_END}${NC}"
+echo -e "  AP reserved IP:    ${CYAN}${AP_MGMT_IP}${NC}  (outside pool — assigned once AP is detected)"
 echo -e "  Default lease:     ${CYAN}${LEASE_TIME}s${NC}"
 echo -e "  Max lease:         ${CYAN}${MAX_LEASE}s${NC}"
 echo -e "  Chrome URL:        ${CYAN}${CHROME_URL}${NC}"
@@ -606,6 +708,7 @@ network:
       nameservers:
         addresses:
           - ${DNS}
+          - ${DNS2}
 NETPLAN_EOF
 
 chmod 600 "$NETPLAN_FILE"
@@ -752,7 +855,7 @@ if command -v anydesk &>/dev/null; then
         systemctl enable --now anydesk.service
 
         NEW_ANYDESK_ID=""
-        for _ in {1..15}; do
+        for _loop_i in {1..15}; do
             NEW_ANYDESK_ID="$(get_anydesk_id || true)"
             [[ -n "$NEW_ANYDESK_ID" ]] && break
             sleep 1
@@ -779,98 +882,147 @@ else
     warn "AnyDesk is not installed; skipping AnyDesk ID reset workflow."
 fi
 
-# ----- 3.5  Install & configure isc-dhcp-server ------------------------------
+# ----- 3.5  Install & configure Kea DHCP4 -----------------------------------
 PHASE="dhcp"
-if dpkg -s isc-dhcp-server &>/dev/null; then
-    success "isc-dhcp-server is already installed — skipping installation"
+
+# On Ubuntu 20.04 kea is in universe; on 24.04 it is in main.
+if dpkg -s kea-dhcp4 &>/dev/null; then
+    success "kea-dhcp4 is already installed — skipping installation"
 else
-    info "Installing isc-dhcp-server..."
-    if ! install_packages isc-dhcp-server; then
-        error "Failed to install isc-dhcp-server. Ensure internet access is available and apt repositories are reachable."
+    # Ubuntu 20.04 ships kea in the 'universe' component — ensure it is enabled.
+    if [[ "$UBUNTU_VERSION" == "20.04" ]]; then
+        info "Enabling universe repository for Ubuntu 20.04..."
+        if ! grep -qr '^deb .* universe' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+            add-apt-repository -y universe
+            _APT_UPDATED=0   # Force re-index after adding universe
+        fi
+    fi
+    info "Installing kea-dhcp4..."
+    if ! install_packages kea-dhcp4; then
+        error "Failed to install kea-dhcp4. Ensure internet access is available."
         exit 1
     fi
-    success "isc-dhcp-server installed"
+    success "kea-dhcp4 installed"
 fi
 
-# Back up existing DHCP config
-[[ -f "$DHCP_CONF" ]] && cp "$DHCP_CONF" "${DHCP_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+mkdir -p "$KEA_CONF_DIR"
+[[ -f "$KEA_CONF" ]] && cp "$KEA_CONF" "${KEA_CONF}.bak.$(date +%Y%m%d%H%M%S)"
 
-cat > "$DHCP_CONF" <<DHCP_EOF
-# Managed by mindspark_setup.sh — do not edit manually
-# MindSpark DHCP configuration
+# Build the AP reservation block — populated by Phase 3.6 after detection.
+# Written as a placeholder now; Phase 3.6 rewrites the full file once the MAC is known.
+AP_RESERVATION_JSON=""
 
-authoritative;
-
-default-lease-time ${LEASE_TIME};
-max-lease-time ${MAX_LEASE};
-
-subnet ${SUBNET} netmask ${NETMASK} {
-    range ${DHCP_START} ${DHCP_END};
-    option routers ${GATEWAY};
-    option domain-name-servers ${DNS};
-    option broadcast-address ${BROADCAST};
+write_kea_conf() {
+    local ap_block="$1"
+    cat > "$KEA_CONF" <<KEA_EOF
+{
+    "Dhcp4": {
+        "interfaces-config": {
+            "interfaces": [ "${NET_IFACE}" ]
+        },
+        "lease-database": {
+            "type": "memfile",
+            "persist": true,
+            "name": "/var/lib/kea/dhcp4.leases"
+        },
+        "valid-lifetime": ${LEASE_TIME},
+        "max-valid-lifetime": ${MAX_LEASE},
+        "option-data": [
+            { "name": "routers",             "data": "${GATEWAY}" },
+            { "name": "domain-name-servers", "data": "${DNS}, ${DNS2}" },
+            { "name": "broadcast-address",   "data": "${BROADCAST}" }
+        ],
+        "subnet4": [
+            {
+                "subnet": "${SUBNET}/${CIDR}",
+                "pools": [ { "pool": "${DHCP_START} - ${DHCP_END}" } ]${ap_block}
+            }
+        ]
+    }
 }
-DHCP_EOF
+KEA_EOF
+    chmod 640 "$KEA_CONF"
+    chown root:_kea "$KEA_CONF" 2>/dev/null || chown root:root "$KEA_CONF"
+}
 
-# Set the listening interface — handle both quoted and unquoted existing values
-if grep -q '^INTERFACESv4=' "$DHCP_DEFAULT"; then
-    sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${NET_IFACE}\"/" "$DHCP_DEFAULT"
+write_kea_conf ""
+success "Kea DHCP4 configuration written to ${KEA_CONF}"
+
+# Validate config
+if ! kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
+    error "kea-dhcp4 config test failed — check ${KEA_CONF}"
+    kea-dhcp4 -t "$KEA_CONF" || true
+    exit 1
+fi
+
+# Enable with auto-restart on failure so it recovers when the AP is plugged in later
+systemctl enable kea-dhcp4
+systemctl set-property kea-dhcp4.service Restart=on-failure RestartSec=10s 2>/dev/null || true
+if ! systemctl restart kea-dhcp4; then
+    # kea-dhcp4 fails if the interface has no carrier — this is expected when the AP
+    # is not yet plugged in. Treat as a warning, not a fatal error.
+    warn "kea-dhcp4 did not start — the AP may not be connected yet. It will retry automatically."
 else
-    echo "INTERFACESv4=\"${NET_IFACE}\"" >> "$DHCP_DEFAULT"
+    success "kea-dhcp4 enabled and started"
 fi
-success "DHCP configuration written to ${DHCP_CONF}"
-
-# Validate config before starting
-if ! dhcpd -t -cf "$DHCP_CONF" 2>/dev/null; then
-    error "dhcpd config test failed — check ${DHCP_CONF}"
-    dhcpd -t -cf "$DHCP_CONF" || true
-    exit 1
-fi
-
-# Enable and restart DHCP server
-systemctl enable isc-dhcp-server
-if ! systemctl restart isc-dhcp-server; then
-    error "isc-dhcp-server failed to start. Journal output:"
-    journalctl -u isc-dhcp-server --no-pager -n 20 >&2 || true
-    exit 1
-fi
-success "isc-dhcp-server enabled and started"
 
 # ----- 3.6  Detect Access Point MAC and add static reservation ---------------
 PHASE="ap-mac-detection"
+
+# Ensure arping is available — it is the most reliable ARP probe tool
+if ! command -v arping &>/dev/null; then
+    info "Installing arping for AP MAC detection..."
+    install_packages iputils-arping 2>/dev/null || true
+fi
+
 info "Attempting to detect Access Point MAC address on ${NET_IFACE}..."
 
-if AP_MAC=$(detect_ap_mac "$NET_IFACE" "$STATIC_IP" "$BROADCAST" "$GATEWAY"); then
+if AP_MAC=$(detect_ap_mac "$NET_IFACE" "$STATIC_IP"); then
     success "Access Point MAC detected: ${AP_MAC}"
 
-    # Take a snapshot of the working config before modifying it
-    cp "$DHCP_CONF" "${DHCP_CONF}.pre-ap"
+    # Build the Kea reservation JSON block and rewrite the full config atomically
+    AP_RESERVATION_JSON=",
+                \"reservations\": [
+                    {
+                        \"hw-address\": \"${AP_MAC}\",
+                        \"ip-address\": \"${AP_MGMT_IP}\"
+                    }
+                ]"
 
-    # Append a static host reservation so the AP always gets AP_MGMT_IP
-    cat >> "$DHCP_CONF" <<AP_RESERVATION_EOF
+    write_kea_conf "$AP_RESERVATION_JSON"
 
-# Access Point — static reservation (MAC detected at setup time)
-host access-point {
-    hardware ethernet ${AP_MAC};
-    fixed-address ${AP_MGMT_IP};
-}
-AP_RESERVATION_EOF
-
-    if dhcpd -t -cf "$DHCP_CONF" 2>/dev/null; then
-        systemctl restart isc-dhcp-server
+    if kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
+        systemctl restart kea-dhcp4 || true
         success "AP static reservation added: ${AP_MAC} → ${AP_MGMT_IP}"
     else
-        warn "dhcpd config validation failed after adding AP reservation — restoring previous config"
-        cp "${DHCP_CONF}.pre-ap" "$DHCP_CONF"
-        systemctl restart isc-dhcp-server || true
+        warn "Kea config validation failed after adding AP reservation — restoring base config"
+        write_kea_conf ""
+        systemctl restart kea-dhcp4 || true
         AP_MAC="(detected but reservation failed — add manually)"
     fi
-    rm -f "${DHCP_CONF}.pre-ap"
 else
-    warn "Access Point not detected on ${NET_IFACE} within 45 seconds."
-    warn "If the AP is not yet connected, add a static DHCP reservation manually once it is."
+    warn "Access Point not detected on ${NET_IFACE} within 60 seconds."
+    warn "If the AP is not yet connected, rerun the script or add the reservation manually."
     AP_MAC="(not detected)"
 fi
+
+# ----- 3.7  NTP hardening ----------------------------------------------------
+PHASE="ntp"
+info "Configuring NTP synchronisation..."
+
+# systemd-timesyncd is built-in to Ubuntu — no extra package needed.
+# Override the fallback NTP server to use well-known public servers.
+NTP_CONF="/etc/systemd/timesyncd.conf.d/mindspark.conf"
+mkdir -p "$(dirname "$NTP_CONF")"
+cat > "$NTP_CONF" <<NTP_EOF
+[Time]
+NTP=time.cloudflare.com ntp.ubuntu.com
+FallbackNTP=0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org
+NTP_EOF
+
+timedatectl set-ntp true
+systemctl restart systemd-timesyncd
+success "NTP configured (time.cloudflare.com, ntp.ubuntu.com)"
 
 # =============================================================================
 # PHASE 4 — Verification
@@ -930,11 +1082,18 @@ fi
 
 # Check DHCP server — tracked separately so we can treat it as an expected warning
 DHCP_ERROR=false
-if systemctl is-active --quiet isc-dhcp-server; then
-    success "isc-dhcp-server is running"
+if systemctl is-active --quiet kea-dhcp4; then
+    success "kea-dhcp4 is running"
 else
-    warn "isc-dhcp-server is NOT running — this is expected if the Access Point is not yet plugged into the server"
+    warn "kea-dhcp4 is not running — expected if the AP is not yet plugged in (auto-retries every 10 s)"
     DHCP_ERROR=true
+fi
+
+# Check NTP
+if timedatectl show 2>/dev/null | grep -q 'NTPSynchronized=yes'; then
+    success "NTP is synchronised"
+else
+    warn "NTP not yet synchronised — will complete once internet is available"
 fi
 
 # Report Access Point MAC
@@ -942,7 +1101,7 @@ if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]
     success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
 else
     warn "Access Point MAC: ${AP_MAC}"
-    warn "To add a reservation later, edit ${DHCP_CONF} and restart isc-dhcp-server"
+    warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
 fi
 
 echo ""
@@ -954,15 +1113,14 @@ if [[ $ERRORS -eq 0 ]]; then
     # Only the DHCP warning (or nothing) — still reboot
     if $DHCP_ERROR; then
         echo ""
-        echo -e "${YELLOW}${BOLD}  Setup complete with 1 expected warning:${NC}"
-        echo -e "${YELLOW}${BOLD}  isc-dhcp-server will start automatically once the${NC}"
-        echo -e "${YELLOW}${BOLD}  Access Point is plugged into this server.${NC}"
+        printf "${YELLOW}${BOLD}  Setup complete with 1 expected warning:\n${NC}"
+        printf "${YELLOW}${BOLD}  kea-dhcp4 will auto-retry once the Access Point is plugged in.\n${NC}"
     else
         echo ""
-        echo -e "${GREEN}${BOLD}  All checks passed — setup complete!${NC}"
+        printf "${GREEN}${BOLD}  All checks passed — setup complete!\n${NC}"
     fi
     echo ""
-    echo -e "${GREEN}${BOLD}  The system will reboot in 10 seconds...${NC}"
+    printf "${GREEN}${BOLD}  The system will reboot in 10 seconds...\n${NC}"
     echo ""
     sleep 10
     reboot
