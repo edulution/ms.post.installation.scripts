@@ -188,6 +188,51 @@ install_packages() {
     apt-get install -y -qq --no-install-recommends "${to_install[@]}"
 }
 
+# --- AP MAC detection --------------------------------------------------------
+# Probes $NET_IFACE after setup to discover the Access Point's MAC address.
+# Strategy:
+#   1. Ping broadcast and gateway to trigger ARP replies.
+#   2. Poll 'ip neigh' for up to 45 seconds.
+#   3. Fall back to parsing dhcpd.leases if ARP yields nothing.
+# Prints the MAC to stdout; returns 1 if not found.
+detect_ap_mac() {
+    local iface="$1" server_ip="$2" broadcast_addr="$3" gateway_addr="$4"
+    local mac=""
+
+    info "Probing network to detect Access Point MAC address (up to 45 s)..."
+
+    # Trigger ARP entries
+    ping -b -c 3 -W 1 "$broadcast_addr" &>/dev/null || true
+    ping -c 3 -W 1 "$gateway_addr" &>/dev/null || true
+
+    # Poll ARP table
+    for _ap_i in $(seq 1 45); do
+        mac=$(ip neigh show dev "$iface" 2>/dev/null \
+            | grep -v "^${server_ip} " \
+            | grep -E 'lladdr [0-9a-f]{2}:' \
+            | awk '{print $5}' \
+            | grep -v '^$' \
+            | head -1)
+        if [[ -n "$mac" ]]; then
+            echo "$mac"
+            return 0
+        fi
+        sleep 1
+    done
+
+    # Fallback: parse dhcpd.leases
+    local leases_file="/var/lib/dhcp/dhcpd.leases"
+    if [[ -f "$leases_file" ]]; then
+        mac=$(grep -oP '(?<=hardware ethernet )[0-9a-f:]+' "$leases_file" | head -1)
+        if [[ -n "$mac" ]]; then
+            echo "$mac"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Networking defaults
 DEFAULT_SUBNET="10.10.10.0"
 DEFAULT_NETMASK="255.255.255.0"
@@ -425,6 +470,8 @@ calculate_subnet() {
         $(( ip_parts[3] & mask_parts[3] ))
 }
 SUBNET=$(calculate_subnet)
+AP_MGMT_IP="${SUBNET%.*}.2"   # Reserved management IP for the Access Point
+AP_MAC=""                      # Populated in Phase 3.6 after DHCP server starts
 
 # Calculate broadcast address in pure bash (avoids mawk compl() incompatibility)
 calculate_broadcast() {
@@ -789,6 +836,42 @@ if ! systemctl restart isc-dhcp-server; then
 fi
 success "isc-dhcp-server enabled and started"
 
+# ----- 3.6  Detect Access Point MAC and add static reservation ---------------
+PHASE="ap-mac-detection"
+info "Attempting to detect Access Point MAC address on ${NET_IFACE}..."
+
+if AP_MAC=$(detect_ap_mac "$NET_IFACE" "$STATIC_IP" "$BROADCAST" "$GATEWAY"); then
+    success "Access Point MAC detected: ${AP_MAC}"
+
+    # Take a snapshot of the working config before modifying it
+    cp "$DHCP_CONF" "${DHCP_CONF}.pre-ap"
+
+    # Append a static host reservation so the AP always gets AP_MGMT_IP
+    cat >> "$DHCP_CONF" <<AP_RESERVATION_EOF
+
+# Access Point — static reservation (MAC detected at setup time)
+host access-point {
+    hardware ethernet ${AP_MAC};
+    fixed-address ${AP_MGMT_IP};
+}
+AP_RESERVATION_EOF
+
+    if dhcpd -t -cf "$DHCP_CONF" 2>/dev/null; then
+        systemctl restart isc-dhcp-server
+        success "AP static reservation added: ${AP_MAC} → ${AP_MGMT_IP}"
+    else
+        warn "dhcpd config validation failed after adding AP reservation — restoring previous config"
+        cp "${DHCP_CONF}.pre-ap" "$DHCP_CONF"
+        systemctl restart isc-dhcp-server || true
+        AP_MAC="(detected but reservation failed — add manually)"
+    fi
+    rm -f "${DHCP_CONF}.pre-ap"
+else
+    warn "Access Point not detected on ${NET_IFACE} within 45 seconds."
+    warn "If the AP is not yet connected, add a static DHCP reservation manually once it is."
+    AP_MAC="(not detected)"
+fi
+
 # =============================================================================
 # PHASE 4 — Verification
 # =============================================================================
@@ -852,6 +935,14 @@ if systemctl is-active --quiet isc-dhcp-server; then
 else
     warn "isc-dhcp-server is NOT running — this is expected if the Access Point is not yet plugged into the server"
     DHCP_ERROR=true
+fi
+
+# Report Access Point MAC
+if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]]; then
+    success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
+else
+    warn "Access Point MAC: ${AP_MAC}"
+    warn "To add a reservation later, edit ${DHCP_CONF} and restart isc-dhcp-server"
 fi
 
 echo ""
