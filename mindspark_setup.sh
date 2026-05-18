@@ -108,6 +108,17 @@ KEA_CONF="${KEA_CONF_DIR}/kea-dhcp4.conf"
 CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/mindspark.json"
 CHROMIUM_POLICY_FILE="/etc/chromium/policies/managed/mindspark.json"
 
+# Kea package and service names differ between Ubuntu releases:
+#   20.04 universe: package=kea-dhcp4-server  service=kea-dhcp4-server
+#   24.04 main:     package=kea-dhcp4         service=kea-dhcp4
+if [[ "${UBUNTU_VERSION:-}" == "20.04" ]]; then
+    KEA_PACKAGE="kea-dhcp4-server"
+    KEA_SERVICE="kea-dhcp4-server"
+else
+    KEA_PACKAGE="kea-dhcp4"
+    KEA_SERVICE="kea-dhcp4"
+fi
+
 # --- Online connectivity check -----------------------------------------------
 # Result is cached after the first call so subsequent callers pay no extra cost.
 _ONLINE_CACHED=""
@@ -598,7 +609,7 @@ if command -v anydesk &>/dev/null; then
     ANYDESK_STATUS="Already installed — will regenerate ID only"
 fi
 DHCP_STATUS="Install & configure"
-if dpkg -s kea-dhcp4 &>/dev/null; then
+if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
     DHCP_STATUS="Already installed — will update configuration only"
 fi
 
@@ -886,8 +897,8 @@ fi
 PHASE="dhcp"
 
 # On Ubuntu 20.04 kea is in universe; on 24.04 it is in main.
-if dpkg -s kea-dhcp4 &>/dev/null; then
-    success "kea-dhcp4 is already installed — skipping installation"
+if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
+    success "${KEA_PACKAGE} is already installed — skipping installation"
 else
     # Ubuntu 20.04 ships kea in the 'universe' component — ensure it is enabled.
     if [[ "$UBUNTU_VERSION" == "20.04" ]]; then
@@ -897,12 +908,12 @@ else
             _APT_UPDATED=0   # Force re-index after adding universe
         fi
     fi
-    info "Installing kea-dhcp4..."
-    if ! install_packages kea-dhcp4; then
-        error "Failed to install kea-dhcp4. Ensure internet access is available."
+    info "Installing ${KEA_PACKAGE}..."
+    if ! install_packages "$KEA_PACKAGE"; then
+        error "Failed to install ${KEA_PACKAGE}. Ensure internet access is available."
         exit 1
     fi
-    success "kea-dhcp4 installed"
+    success "${KEA_PACKAGE} installed"
 fi
 
 mkdir -p "$KEA_CONF_DIR"
@@ -956,14 +967,14 @@ if ! kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
 fi
 
 # Enable with auto-restart on failure so it recovers when the AP is plugged in later
-systemctl enable kea-dhcp4
-systemctl set-property kea-dhcp4.service Restart=on-failure RestartSec=10s 2>/dev/null || true
-if ! systemctl restart kea-dhcp4; then
+systemctl enable "$KEA_SERVICE"
+systemctl set-property "${KEA_SERVICE}.service" Restart=on-failure RestartSec=10s 2>/dev/null || true
+if ! systemctl restart "$KEA_SERVICE"; then
     # kea-dhcp4 fails if the interface has no carrier — this is expected when the AP
     # is not yet plugged in. Treat as a warning, not a fatal error.
-    warn "kea-dhcp4 did not start — the AP may not be connected yet. It will retry automatically."
+    warn "${KEA_SERVICE} did not start — the AP may not be connected yet. It will retry automatically."
 else
-    success "kea-dhcp4 enabled and started"
+    success "${KEA_SERVICE} enabled and started"
 fi
 
 # ----- 3.6  Detect Access Point MAC and add static reservation ---------------
@@ -992,12 +1003,12 @@ if AP_MAC=$(detect_ap_mac "$NET_IFACE" "$STATIC_IP"); then
     write_kea_conf "$AP_RESERVATION_JSON"
 
     if kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
-        systemctl restart kea-dhcp4 || true
+        systemctl restart "$KEA_SERVICE" || true
         success "AP static reservation added: ${AP_MAC} → ${AP_MGMT_IP}"
     else
         warn "Kea config validation failed after adding AP reservation — restoring base config"
         write_kea_conf ""
-        systemctl restart kea-dhcp4 || true
+        systemctl restart "$KEA_SERVICE" || true
         AP_MAC="(detected but reservation failed — add manually)"
     fi
 else
@@ -1082,10 +1093,10 @@ fi
 
 # Check DHCP server — tracked separately so we can treat it as an expected warning
 DHCP_ERROR=false
-if systemctl is-active --quiet kea-dhcp4; then
-    success "kea-dhcp4 is running"
+if systemctl is-active --quiet "$KEA_SERVICE"; then
+    success "${KEA_SERVICE} is running"
 else
-    warn "kea-dhcp4 is not running — expected if the AP is not yet plugged in (auto-retries every 10 s)"
+    warn "${KEA_SERVICE} is not running — expected if the AP is not yet plugged in (auto-retries every 10 s)"
     DHCP_ERROR=true
 fi
 
