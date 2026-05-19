@@ -949,7 +949,10 @@ write_kea_conf() {
 {
     "Dhcp4": {
         "interfaces-config": {
-            "interfaces": [ "${NET_IFACE}" ]
+            "interfaces": [ "${NET_IFACE}" ],
+            "service-sockets-require-all": false,
+            "service-sockets-max-retries": 5,
+            "service-sockets-retry-wait-time": 5000
         },
         "lease-database": {
             "type": "memfile",
@@ -986,15 +989,25 @@ if ! kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
     exit 1
 fi
 
-# Enable with auto-restart on failure so it recovers when the AP is plugged in later
+# Create a persistent systemd drop-in so kea auto-restarts indefinitely when
+# the AP is not yet connected (service-sockets-require-all=false handles the
+# socket-open side; this handles any other transient start failure).
+mkdir -p "/etc/systemd/system/${KEA_SERVICE}.service.d"
+cat > "/etc/systemd/system/${KEA_SERVICE}.service.d/mindspark-restart.conf" <<DROPIN_EOF
+[Service]
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=0
+DROPIN_EOF
+systemctl daemon-reload
 systemctl enable "$KEA_SERVICE"
-systemctl set-property "${KEA_SERVICE}.service" Restart=on-failure RestartSec=10s 2>/dev/null || true
-if ! systemctl restart "$KEA_SERVICE"; then
-    # kea-dhcp4 fails if the interface has no carrier — this is expected when the AP
-    # is not yet plugged in. Treat as a warning, not a fatal error.
-    warn "${KEA_SERVICE} did not start — the AP may not be connected yet. It will retry automatically."
-else
+if systemctl restart "$KEA_SERVICE"; then
     success "${KEA_SERVICE} enabled and started"
+else
+    warn "${KEA_SERVICE} did not start immediately — expected if the AP is not yet connected. It will retry every 15 s automatically."
+    # Reset the failed state so systemd's restart logic kicks in
+    systemctl reset-failed "$KEA_SERVICE" 2>/dev/null || true
+    systemctl start "$KEA_SERVICE" 2>/dev/null || true
 fi
 
 # ----- 3.6  Detect Access Point MAC and add static reservation ---------------
