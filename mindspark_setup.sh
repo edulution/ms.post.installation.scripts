@@ -392,6 +392,41 @@ select_country() {
     echo "$choice"
 }
 
+# AP type determines whether the server needs to run a DHCP server:
+#   unifi      — requires external DHCP (kea installed)
+#   grandstream — has built-in DHCP (kea skipped)
+select_ap_type() {
+    if ! command -v whiptail &>/dev/null; then
+        warn "whiptail is not available. Falling back to text menu."
+        select choice in "unifi" "grandstream"; do
+            case "$choice" in
+                unifi|grandstream)
+                    echo "$choice"
+                    return 0
+                    ;;
+                *)
+                    warn "Invalid selection. Choose 1 or 2."
+                    ;;
+            esac
+        done
+        return 0
+    fi
+
+    local choice=""
+    choice=$(whiptail \
+        --title "MindSpark Access Point" \
+        --menu "Select the Access Point type:" \
+        15 60 2 \
+        "unifi" "UniFi AP  (server provides DHCP via kea)" \
+        "grandstream" "Grandstream AP  (AP provides its own DHCP)" \
+        3>&1 1>&2 2>&3) || {
+        error "AP type selection cancelled."
+        exit 1
+    }
+
+    echo "$choice"
+}
+
 # =============================================================================
 # PHASE 1 — Gather information interactively
 # =============================================================================
@@ -441,6 +476,14 @@ case "$COUNTRY_NORMALIZED" in
         error "Unsupported country selection '${COUNTRY_NORMALIZED}'."
         exit 1
         ;;
+esac
+
+# --- AP type ---------------------------------------------------------------
+echo ""
+AP_TYPE="$(select_ap_type)"
+case "$AP_TYPE" in
+    unifi)       AP_TYPE_LABEL="UniFi" ;;
+    grandstream) AP_TYPE_LABEL="Grandstream" ;;
 esac
 
 # --- Network interface -------------------------------------------------------
@@ -614,9 +657,10 @@ BROADCAST=$(calculate_broadcast)
 CHROME_URL="http://${STATIC_IP}"
 SYNC_STATUS_URL="${CHROME_URL}/Mindspark/SyncStatus.php"
 
-# Grandstream APs (South Africa) have their own built-in DHCP server — kea is
-# not needed and would conflict. Only install kea for Zambia.
-if [[ "$COUNTRY_NORMALIZED" == "zambia" ]]; then
+# NEEDS_DHCP is driven by AP type, not country:
+#   UniFi      — requires kea (no built-in DHCP server)
+#   Grandstream — skips kea (AP handles DHCP itself)
+if [[ "$AP_TYPE" == "unifi" ]]; then
     NEEDS_DHCP=true
 else
     NEEDS_DHCP=false
@@ -632,7 +676,7 @@ ANYDESK_STATUS="Install & regenerate ID"
 if command -v anydesk &>/dev/null; then
     ANYDESK_STATUS="Already installed — will regenerate ID only"
 fi
-DHCP_STATUS="Not required (Grandstream AP handles DHCP)"
+DHCP_STATUS="Not required (${AP_TYPE_LABEL} AP handles DHCP)"
 if $NEEDS_DHCP; then
     DHCP_STATUS="Install & configure"
     if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
@@ -655,6 +699,7 @@ else
     echo -e "  Server label:      ${CYAN}(not set)${NC}"
 fi
 echo -e "  Country:           ${CYAN}${COUNTRY}${NC}"
+echo -e "  Access Point:      ${CYAN}${AP_TYPE_LABEL}${NC}"
 echo -e "  Interface:         ${CYAN}${NET_IFACE}${NC}  (MAC: ${IFACE_MAC})"
 echo -e "  Static IP:         ${CYAN}${STATIC_IP}/${CIDR}${NC}"
 echo -e "  Gateway:           ${CYAN}${GATEWAY}${NC}"
@@ -1163,7 +1208,7 @@ if $NEEDS_DHCP; then
         warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
     fi
 else
-    success "DHCP: handled by Grandstream AP (kea not installed)"
+    success "DHCP: handled by ${AP_TYPE_LABEL} AP (kea not installed)"
 fi
 
 # Check NTP
