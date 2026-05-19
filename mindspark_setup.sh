@@ -614,6 +614,14 @@ BROADCAST=$(calculate_broadcast)
 CHROME_URL="http://${STATIC_IP}"
 SYNC_STATUS_URL="${CHROME_URL}/Mindspark/SyncStatus.php"
 
+# Grandstream APs (South Africa) have their own built-in DHCP server — kea is
+# not needed and would conflict. Only install kea for Zambia.
+if [[ "$COUNTRY_NORMALIZED" == "zambia" ]]; then
+    NEEDS_DHCP=true
+else
+    NEEDS_DHCP=false
+fi
+
 # Determine what will happen for each component
 IFACE_MAC=$(ip link show "$NET_IFACE" 2>/dev/null | awk '/link\/ether/{print $2}' || echo "unknown")
 CHROME_STATUS="Install & configure"
@@ -624,9 +632,12 @@ ANYDESK_STATUS="Install & regenerate ID"
 if command -v anydesk &>/dev/null; then
     ANYDESK_STATUS="Already installed — will regenerate ID only"
 fi
-DHCP_STATUS="Install & configure"
-if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
-    DHCP_STATUS="Already installed — will update configuration only"
+DHCP_STATUS="Not required (Grandstream AP handles DHCP)"
+if $NEEDS_DHCP; then
+    DHCP_STATUS="Install & configure"
+    if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
+        DHCP_STATUS="Already installed — will update configuration only"
+    fi
 fi
 
 # =============================================================================
@@ -650,11 +661,13 @@ echo -e "  Gateway:           ${CYAN}${GATEWAY}${NC}"
 echo -e "  DNS (primary):     ${CYAN}${DNS}${NC}"
 echo -e "  DNS (secondary):   ${CYAN}${DNS2}${NC}"
 echo ""
-echo -e "  DHCP subnet:       ${CYAN}${SUBNET}/${CIDR}${NC}"
-echo -e "  DHCP range:        ${CYAN}${DHCP_START} – ${DHCP_END}${NC}"
-echo -e "  AP reserved IP:    ${CYAN}${AP_MGMT_IP}${NC}  (outside pool — assigned once AP is detected)"
-echo -e "  Default lease:     ${CYAN}${LEASE_TIME}s${NC}"
-echo -e "  Max lease:         ${CYAN}${MAX_LEASE}s${NC}"
+if $NEEDS_DHCP; then
+    echo -e "  DHCP subnet:       ${CYAN}${SUBNET}/${CIDR}${NC}"
+    echo -e "  DHCP range:        ${CYAN}${DHCP_START} – ${DHCP_END}${NC}"
+    echo -e "  AP reserved IP:    ${CYAN}${AP_MGMT_IP}${NC}  (outside pool — assigned once AP is detected)"
+    echo -e "  Default lease:     ${CYAN}${LEASE_TIME}s${NC}"
+    echo -e "  Max lease:         ${CYAN}${MAX_LEASE}s${NC}"
+fi
 echo -e "  Chrome URL:        ${CYAN}${CHROME_URL}${NC}"
 echo -e "  Sync Status URL:   ${CYAN}${SYNC_STATUS_URL}${NC}"
 echo ""
@@ -913,10 +926,15 @@ else
     warn "AnyDesk is not installed; skipping AnyDesk ID reset workflow."
 fi
 
-# ----- 3.5  Install & configure Kea DHCP4 -----------------------------------
+# ----- 3.5  Install & configure Kea DHCP4 (Zambia only) --------------------
 PHASE="dhcp"
 
+if ! $NEEDS_DHCP; then
+    info "Skipping Kea DHCP4 installation — Grandstream AP handles DHCP for South Africa"
+fi
+
 # On Ubuntu 20.04 kea is in universe; on 24.04 it is in main.
+if $NEEDS_DHCP; then
 if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
     success "${KEA_PACKAGE} is already installed — skipping installation"
 else
@@ -1010,8 +1028,11 @@ else
     systemctl start "$KEA_SERVICE" 2>/dev/null || true
 fi
 
+fi  # end NEEDS_DHCP — phase 3.5
+
 # ----- 3.6  Detect Access Point MAC and add static reservation ---------------
 PHASE="ap-mac-detection"
+if $NEEDS_DHCP; then
 
 # Ensure arping is available — it is the most reliable ARP probe tool
 if ! command -v arping &>/dev/null; then
@@ -1049,6 +1070,7 @@ else
     warn "If the AP is not yet connected, rerun the script or add the reservation manually."
     AP_MAC="(not detected)"
 fi
+fi  # end NEEDS_DHCP — phase 3.6
 
 # ----- 3.7  NTP hardening ----------------------------------------------------
 PHASE="ntp"
@@ -1124,13 +1146,24 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
-# Check DHCP server — tracked separately so we can treat it as an expected warning
+# Check DHCP server (Zambia only)
 DHCP_ERROR=false
-if systemctl is-active --quiet "$KEA_SERVICE"; then
-    success "${KEA_SERVICE} is running"
+if $NEEDS_DHCP; then
+    if systemctl is-active --quiet "$KEA_SERVICE"; then
+        success "${KEA_SERVICE} is running"
+    else
+        warn "${KEA_SERVICE} is not running — expected if the AP is not yet plugged in (auto-retries every 15 s)"
+        DHCP_ERROR=true
+    fi
+    # Report Access Point MAC
+    if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]]; then
+        success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
+    else
+        warn "Access Point MAC: ${AP_MAC}"
+        warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
+    fi
 else
-    warn "${KEA_SERVICE} is not running — expected if the AP is not yet plugged in (auto-retries every 10 s)"
-    DHCP_ERROR=true
+    success "DHCP: handled by Grandstream AP (kea not installed)"
 fi
 
 # Check NTP
@@ -1138,14 +1171,6 @@ if timedatectl show 2>/dev/null | grep -q 'NTPSynchronized=yes'; then
     success "NTP is synchronised"
 else
     warn "NTP not yet synchronised — will complete once internet is available"
-fi
-
-# Report Access Point MAC
-if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]]; then
-    success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
-else
-    warn "Access Point MAC: ${AP_MAC}"
-    warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
 fi
 
 echo ""
