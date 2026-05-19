@@ -108,16 +108,12 @@ KEA_CONF="${KEA_CONF_DIR}/kea-dhcp4.conf"
 CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/mindspark.json"
 CHROMIUM_POLICY_FILE="/etc/chromium/policies/managed/mindspark.json"
 
-# Kea package and service names differ between Ubuntu releases:
+# Kea package and service names:
 #   20.04 universe: package=kea-dhcp4-server  service=kea-dhcp4-server
-#   24.04 main:     package=kea-dhcp4         service=kea-dhcp4
-if [[ "${UBUNTU_VERSION:-}" == "20.04" ]]; then
-    KEA_PACKAGE="kea-dhcp4-server"
-    KEA_SERVICE="kea-dhcp4-server"
-else
-    KEA_PACKAGE="kea-dhcp4"
-    KEA_SERVICE="kea-dhcp4"
-fi
+#   24.04 main:     package=kea-dhcp4-server  service=kea-dhcp4-server
+# (The package was never named 'kea-dhcp4' in Ubuntu — that name does not exist.)
+KEA_PACKAGE="kea-dhcp4-server"
+KEA_SERVICE="kea-dhcp4-server"
 
 # --- Online connectivity check -----------------------------------------------
 # Result is cached after the first call so subsequent callers pay no extra cost.
@@ -132,6 +128,26 @@ is_online() {
         fi
     fi
     [[ "$_ONLINE_CACHED" == "yes" ]]
+}
+
+# Waits up to $1 seconds (default 90) for internet connectivity to return.
+# Resets _ONLINE_CACHED first so is_online() does a live probe each iteration.
+wait_for_connectivity() {
+    local timeout="${1:-90}" elapsed=0
+    _ONLINE_CACHED=""
+    if is_online; then return 0; fi
+    info "Waiting for internet connectivity (up to ${timeout}s)..."
+    while (( elapsed < timeout )); do
+        sleep 3
+        elapsed=$(( elapsed + 3 ))
+        _ONLINE_CACHED=""
+        if is_online; then
+            success "Internet connectivity restored after ${elapsed}s"
+            return 0
+        fi
+    done
+    error "No internet connectivity after ${timeout}s."
+    return 1
 }
 
 # --- Pre-flight runtime sanity (prevent running on already-broken systems) ---
@@ -735,6 +751,10 @@ if [[ "$NETPLAN_RENDERER" == "NetworkManager" ]]; then
 else
     sleep 3
 fi
+
+# netplan apply (and NM connection reload) can briefly drop the WiFi connection
+# that is providing internet access.  Reset the cached online state and wait.
+wait_for_connectivity 90
 
 PHASE="post-netplan"
 success "Netplan configured (${NETPLAN_FILE}) using renderer: ${NETPLAN_RENDERER}"
