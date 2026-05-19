@@ -108,16 +108,12 @@ KEA_CONF="${KEA_CONF_DIR}/kea-dhcp4.conf"
 CHROME_POLICY_FILE="/etc/opt/chrome/policies/managed/mindspark.json"
 CHROMIUM_POLICY_FILE="/etc/chromium/policies/managed/mindspark.json"
 
-# Kea package and service names differ between Ubuntu releases:
+# Kea package and service names:
 #   20.04 universe: package=kea-dhcp4-server  service=kea-dhcp4-server
-#   24.04 main:     package=kea-dhcp4         service=kea-dhcp4
-if [[ "${UBUNTU_VERSION:-}" == "20.04" ]]; then
-    KEA_PACKAGE="kea-dhcp4-server"
-    KEA_SERVICE="kea-dhcp4-server"
-else
-    KEA_PACKAGE="kea-dhcp4"
-    KEA_SERVICE="kea-dhcp4"
-fi
+#   24.04 main:     package=kea-dhcp4-server  service=kea-dhcp4-server
+# (The package was never named 'kea-dhcp4' in Ubuntu — that name does not exist.)
+KEA_PACKAGE="kea-dhcp4-server"
+KEA_SERVICE="kea-dhcp4-server"
 
 # --- Online connectivity check -----------------------------------------------
 # Result is cached after the first call so subsequent callers pay no extra cost.
@@ -132,6 +128,26 @@ is_online() {
         fi
     fi
     [[ "$_ONLINE_CACHED" == "yes" ]]
+}
+
+# Waits up to $1 seconds (default 90) for internet connectivity to return.
+# Resets _ONLINE_CACHED first so is_online() does a live probe each iteration.
+wait_for_connectivity() {
+    local timeout="${1:-90}" elapsed=0
+    _ONLINE_CACHED=""
+    if is_online; then return 0; fi
+    info "Waiting for internet connectivity (up to ${timeout}s)..."
+    while (( elapsed < timeout )); do
+        sleep 3
+        elapsed=$(( elapsed + 3 ))
+        _ONLINE_CACHED=""
+        if is_online; then
+            success "Internet connectivity restored after ${elapsed}s"
+            return 0
+        fi
+    done
+    error "No internet connectivity after ${timeout}s."
+    return 1
 }
 
 # --- Pre-flight runtime sanity (prevent running on already-broken systems) ---
@@ -376,6 +392,41 @@ select_country() {
     echo "$choice"
 }
 
+# AP type determines whether the server needs to run a DHCP server:
+#   unifi      — requires external DHCP (kea installed)
+#   grandstream — has built-in DHCP (kea skipped)
+select_ap_type() {
+    if ! command -v whiptail &>/dev/null; then
+        warn "whiptail is not available. Falling back to text menu."
+        select choice in "unifi" "grandstream"; do
+            case "$choice" in
+                unifi|grandstream)
+                    echo "$choice"
+                    return 0
+                    ;;
+                *)
+                    warn "Invalid selection. Choose 1 or 2."
+                    ;;
+            esac
+        done
+        return 0
+    fi
+
+    local choice=""
+    choice=$(whiptail \
+        --title "MindSpark Access Point" \
+        --menu "Select the Access Point type:" \
+        15 60 2 \
+        "unifi" "UniFi AP  (server provides DHCP via kea)" \
+        "grandstream" "Grandstream AP  (AP provides its own DHCP)" \
+        3>&1 1>&2 2>&3) || {
+        error "AP type selection cancelled."
+        exit 1
+    }
+
+    echo "$choice"
+}
+
 # =============================================================================
 # PHASE 1 — Gather information interactively
 # =============================================================================
@@ -425,6 +476,14 @@ case "$COUNTRY_NORMALIZED" in
         error "Unsupported country selection '${COUNTRY_NORMALIZED}'."
         exit 1
         ;;
+esac
+
+# --- AP type ---------------------------------------------------------------
+echo ""
+AP_TYPE="$(select_ap_type)"
+case "$AP_TYPE" in
+    unifi)       AP_TYPE_LABEL="UniFi" ;;
+    grandstream) AP_TYPE_LABEL="Grandstream" ;;
 esac
 
 # --- Network interface -------------------------------------------------------
@@ -598,6 +657,15 @@ BROADCAST=$(calculate_broadcast)
 CHROME_URL="http://${STATIC_IP}"
 SYNC_STATUS_URL="${CHROME_URL}/Mindspark/SyncStatus.php"
 
+# NEEDS_DHCP is driven by AP type, not country:
+#   UniFi      — requires kea (no built-in DHCP server)
+#   Grandstream — skips kea (AP handles DHCP itself)
+if [[ "$AP_TYPE" == "unifi" ]]; then
+    NEEDS_DHCP=true
+else
+    NEEDS_DHCP=false
+fi
+
 # Determine what will happen for each component
 IFACE_MAC=$(ip link show "$NET_IFACE" 2>/dev/null | awk '/link\/ether/{print $2}' || echo "unknown")
 CHROME_STATUS="Install & configure"
@@ -608,9 +676,12 @@ ANYDESK_STATUS="Install & regenerate ID"
 if command -v anydesk &>/dev/null; then
     ANYDESK_STATUS="Already installed — will regenerate ID only"
 fi
-DHCP_STATUS="Install & configure"
-if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
-    DHCP_STATUS="Already installed — will update configuration only"
+DHCP_STATUS="Not required (${AP_TYPE_LABEL} AP handles DHCP)"
+if $NEEDS_DHCP; then
+    DHCP_STATUS="Install & configure"
+    if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
+        DHCP_STATUS="Already installed — will update configuration only"
+    fi
 fi
 
 # =============================================================================
@@ -628,17 +699,20 @@ else
     echo -e "  Server label:      ${CYAN}(not set)${NC}"
 fi
 echo -e "  Country:           ${CYAN}${COUNTRY}${NC}"
+echo -e "  Access Point:      ${CYAN}${AP_TYPE_LABEL}${NC}"
 echo -e "  Interface:         ${CYAN}${NET_IFACE}${NC}  (MAC: ${IFACE_MAC})"
 echo -e "  Static IP:         ${CYAN}${STATIC_IP}/${CIDR}${NC}"
 echo -e "  Gateway:           ${CYAN}${GATEWAY}${NC}"
 echo -e "  DNS (primary):     ${CYAN}${DNS}${NC}"
 echo -e "  DNS (secondary):   ${CYAN}${DNS2}${NC}"
 echo ""
-echo -e "  DHCP subnet:       ${CYAN}${SUBNET}/${CIDR}${NC}"
-echo -e "  DHCP range:        ${CYAN}${DHCP_START} – ${DHCP_END}${NC}"
-echo -e "  AP reserved IP:    ${CYAN}${AP_MGMT_IP}${NC}  (outside pool — assigned once AP is detected)"
-echo -e "  Default lease:     ${CYAN}${LEASE_TIME}s${NC}"
-echo -e "  Max lease:         ${CYAN}${MAX_LEASE}s${NC}"
+if $NEEDS_DHCP; then
+    echo -e "  DHCP subnet:       ${CYAN}${SUBNET}/${CIDR}${NC}"
+    echo -e "  DHCP range:        ${CYAN}${DHCP_START} – ${DHCP_END}${NC}"
+    echo -e "  AP reserved IP:    ${CYAN}${AP_MGMT_IP}${NC}  (outside pool — assigned once AP is detected)"
+    echo -e "  Default lease:     ${CYAN}${LEASE_TIME}s${NC}"
+    echo -e "  Max lease:         ${CYAN}${MAX_LEASE}s${NC}"
+fi
 echo -e "  Chrome URL:        ${CYAN}${CHROME_URL}${NC}"
 echo -e "  Sync Status URL:   ${CYAN}${SYNC_STATUS_URL}${NC}"
 echo ""
@@ -735,6 +809,10 @@ if [[ "$NETPLAN_RENDERER" == "NetworkManager" ]]; then
 else
     sleep 3
 fi
+
+# netplan apply (and NM connection reload) can briefly drop the WiFi connection
+# that is providing internet access.  Reset the cached online state and wait.
+wait_for_connectivity 90
 
 PHASE="post-netplan"
 success "Netplan configured (${NETPLAN_FILE}) using renderer: ${NETPLAN_RENDERER}"
@@ -893,10 +971,15 @@ else
     warn "AnyDesk is not installed; skipping AnyDesk ID reset workflow."
 fi
 
-# ----- 3.5  Install & configure Kea DHCP4 -----------------------------------
+# ----- 3.5  Install & configure Kea DHCP4 (Zambia only) --------------------
 PHASE="dhcp"
 
+if ! $NEEDS_DHCP; then
+    info "Skipping Kea DHCP4 installation — Grandstream AP handles DHCP for South Africa"
+fi
+
 # On Ubuntu 20.04 kea is in universe; on 24.04 it is in main.
+if $NEEDS_DHCP; then
 if dpkg -s "$KEA_PACKAGE" &>/dev/null; then
     success "${KEA_PACKAGE} is already installed — skipping installation"
 else
@@ -929,7 +1012,10 @@ write_kea_conf() {
 {
     "Dhcp4": {
         "interfaces-config": {
-            "interfaces": [ "${NET_IFACE}" ]
+            "interfaces": [ "${NET_IFACE}" ],
+            "service-sockets-require-all": false,
+            "service-sockets-max-retries": 5,
+            "service-sockets-retry-wait-time": 5000
         },
         "lease-database": {
             "type": "memfile",
@@ -966,19 +1052,32 @@ if ! kea-dhcp4 -t "$KEA_CONF" 2>/dev/null; then
     exit 1
 fi
 
-# Enable with auto-restart on failure so it recovers when the AP is plugged in later
+# Create a persistent systemd drop-in so kea auto-restarts indefinitely when
+# the AP is not yet connected (service-sockets-require-all=false handles the
+# socket-open side; this handles any other transient start failure).
+mkdir -p "/etc/systemd/system/${KEA_SERVICE}.service.d"
+cat > "/etc/systemd/system/${KEA_SERVICE}.service.d/mindspark-restart.conf" <<DROPIN_EOF
+[Service]
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=0
+DROPIN_EOF
+systemctl daemon-reload
 systemctl enable "$KEA_SERVICE"
-systemctl set-property "${KEA_SERVICE}.service" Restart=on-failure RestartSec=10s 2>/dev/null || true
-if ! systemctl restart "$KEA_SERVICE"; then
-    # kea-dhcp4 fails if the interface has no carrier — this is expected when the AP
-    # is not yet plugged in. Treat as a warning, not a fatal error.
-    warn "${KEA_SERVICE} did not start — the AP may not be connected yet. It will retry automatically."
-else
+if systemctl restart "$KEA_SERVICE"; then
     success "${KEA_SERVICE} enabled and started"
+else
+    warn "${KEA_SERVICE} did not start immediately — expected if the AP is not yet connected. It will retry every 15 s automatically."
+    # Reset the failed state so systemd's restart logic kicks in
+    systemctl reset-failed "$KEA_SERVICE" 2>/dev/null || true
+    systemctl start "$KEA_SERVICE" 2>/dev/null || true
 fi
+
+fi  # end NEEDS_DHCP — phase 3.5
 
 # ----- 3.6  Detect Access Point MAC and add static reservation ---------------
 PHASE="ap-mac-detection"
+if $NEEDS_DHCP; then
 
 # Ensure arping is available — it is the most reliable ARP probe tool
 if ! command -v arping &>/dev/null; then
@@ -1016,6 +1115,7 @@ else
     warn "If the AP is not yet connected, rerun the script or add the reservation manually."
     AP_MAC="(not detected)"
 fi
+fi  # end NEEDS_DHCP — phase 3.6
 
 # ----- 3.7  NTP hardening ----------------------------------------------------
 PHASE="ntp"
@@ -1091,13 +1191,24 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
-# Check DHCP server — tracked separately so we can treat it as an expected warning
+# Check DHCP server (Zambia only)
 DHCP_ERROR=false
-if systemctl is-active --quiet "$KEA_SERVICE"; then
-    success "${KEA_SERVICE} is running"
+if $NEEDS_DHCP; then
+    if systemctl is-active --quiet "$KEA_SERVICE"; then
+        success "${KEA_SERVICE} is running"
+    else
+        warn "${KEA_SERVICE} is not running — expected if the AP is not yet plugged in (auto-retries every 15 s)"
+        DHCP_ERROR=true
+    fi
+    # Report Access Point MAC
+    if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]]; then
+        success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
+    else
+        warn "Access Point MAC: ${AP_MAC}"
+        warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
+    fi
 else
-    warn "${KEA_SERVICE} is not running — expected if the AP is not yet plugged in (auto-retries every 10 s)"
-    DHCP_ERROR=true
+    success "DHCP: handled by ${AP_TYPE_LABEL} AP (kea not installed)"
 fi
 
 # Check NTP
@@ -1105,14 +1216,6 @@ if timedatectl show 2>/dev/null | grep -q 'NTPSynchronized=yes'; then
     success "NTP is synchronised"
 else
     warn "NTP not yet synchronised — will complete once internet is available"
-fi
-
-# Report Access Point MAC
-if [[ -n "$AP_MAC" && "$AP_MAC" != "(not detected)" && "$AP_MAC" != *"failed"* ]]; then
-    success "Access Point MAC: ${AP_MAC}  →  reserved IP: ${AP_MGMT_IP}"
-else
-    warn "Access Point MAC: ${AP_MAC}"
-    warn "To add a reservation later, edit ${KEA_CONF} and restart kea-dhcp4"
 fi
 
 echo ""
